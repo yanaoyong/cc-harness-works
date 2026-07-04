@@ -1,0 +1,74 @@
+{
+  "_note": "RM-141 落地 + feat-plugin-hooks-commands-migration-20260701 补齐 + fix-resident-contract-hook-consistency-20260702 修订：SessionStart(5) + PreToolUse(2: Bash+Skill) + PostToolUse(1: Edit|Write|MultiEdit) + Stop(1) 共 9 个钩子。仅 manifest 注册，plugin 安装态生效；本仓运行时引用仍以 .claude/settings.json 为准。SessionStart 顺序假设按单 group 内层 hooks 数组序执行（D-7 finding 基此假设）：session-start（脚手架落盘）先行、session_start_resident_contract（契约注入）在后，与注入源三级回退链构成首会话双保险。三维护 hook（autosync/autoflip/wiki_freshness）注册取舍：autosync 无额外资产依赖、注册即生效；autoflip 依赖 $TOP/.harness/scripts/lib/merged_detect.sh——纯 plugin 安装态该资产未随脚手架落盘时 fail-open no-op（守卫静默 exit 0 永不阻断），注册使其就绪待命而非即时生效，依赖资产补齐属后续卡（R-6）；wiki_freshness 已由 fix-wiki-freshness-hook-20260702 改为 wiki-rescan bin 三级回退链定位（$TOP/.harness/ 消费方安装态 → $TOP/plugins/harness-core/ 本仓开发态 → $CLAUDE_PLUGIN_ROOT/ plugin 包内直读 · 首个可读即用），本仓开发态即时生效；三级全不命中仍 fail-open 静默 exit 0 永不阻断。本 hooks.json 与本仓 .claude/settings.json 两注册点顺序独立、各自成立（plugin 安装态需脚手架先行；本仓开发态注入源回退链②恒可用故顺序无关），顺序不同为有意设计而非漂移。PostToolUse 使用 stop_progress_check.sh（非 post_edit_checks.sh——项目特定，不入 plugin）。",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh\""
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start_resident_contract.sh\""
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start_autosync.sh\""
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start_autoflip.sh\""
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start_wiki_freshness.sh\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/pre_bash_guard.sh\""
+          }
+        ]
+      },
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/pretool_skill_usage_log.sh\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/stop_progress_check.sh\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/stop_progress_check.sh\""
+          }
+        ]
+      }
+    ],
+    "SessionEnd": []
+  }
+}

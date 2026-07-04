@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+"""wiki-query — 把 WK-Q 四步查询 SOP 塌缩为单命令（RM-2026-118 · ADR-009 决策 B）。
+
+调用方（agent / Owner / 人）调一条命令拿完整答案，不再背「四步 SOP」：
+  ① index 导航：读 <wiki>/index.md，解析 [[wikilink]]，按问题关键词匹配候选页
+  ② rg 补候选：rg -l "<关键词>" <wiki>，词法召回补候选页
+  ③ 两跳溯源：第一跳读命中页正文；第二跳读页 frontmatter sources: 得源文件路径
+  ④ 断链/未覆盖回退：候选页==0 或两跳断链 → 默认回退开时命令内部自动回退 grep
+
+输出三要素（stdout = 面向 agent 的答案文本 · 非 JSON · CLI-002 适配例外）：
+  ① wiki 命中段（两跳引用 + 命中页正文 · 输出做全）
+  ② grep 回退段（仅未覆盖/断链时 · 标注头 + filePath:line 片段）
+  ③ 在band 提示语（返回文本末尾 · 命中态/回退态各措辞 · 建议非门禁）
+
+退出码（CLI-009 失败软化）：
+  0  成功外形（命中或 grep 回退均 0）· 永不 isError / 永不空落
+  2  参数错误（空问题 / 非法选项 / --wiki 指向不存在的 corpus 目录 · CLI-012 诚实报错）
+  5  内部错误（退化兜底 · corpus 目录与 rg 回退底座均不可用 · 罕见）
+  不用 exit 1（exit 1 是 wiki-lint 专用门禁信号 · 查询无门禁语义）
+
+旁路红线（C-A1 / ADR-005）：本 bin 是纯查询命令——不写任何 hook、不改任何门禁判定式、
+不拦 Read/Grep；在band 提示是返回文本里的建议字符串而已。
+
+纪律：薄封装复用 v1 既有 index/rg/两跳逻辑，不另造检索引擎 / 无向量 / 无 RAG / 无 daemon。
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+META_DIR = "_meta"
+STATE_FILE = "state.json"
+
+# 复用 wiki-lint 同款 wikilink 正则（薄封装复用点 · 不另造解析）。
+WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
+
+# --budget：输出字符预算上限。
+# RM-121 实测校准（PH-1）：本项目 wiki=203 页，正文字符分布 median≈2192 / p90≈2984 / max=5552
+# （非 RM-118 占位注释误写的「400–900 字/页」·偏小约 3–5×）。DEFAULT_BUDGET=8000 在此分布下
+# 约容 3.6 中位页 / 2.3 p90 页 / 1.4 max 页全文——典型窄查询（命中 1–3 页）全文不腰斩；宽查询
+# 首页（最高相关）恒全文保留、尾部低相关页正文才截（RK-2）。保持 8000 量级、绝不照搬 codegraph
+# 24K（语境不同·ADR-009 §后果）；度量证据见 coding/calibration_evidence.md。
+DEFAULT_BUDGET = 8000
+
+# 回退 grep 敏感目录/文件 deny-list（PH-3 · CLI-011 / R-005·CODE-005）。
+# RM-121 实测校准：源域 source_dirs 全 1666 文件实测——真敏感文件=0、当前 deny 误排=0（纯纵深
+# 防御 defense-in-depth · 为 source_dirs 未来扩容兜底）。已扩补常见敏感片段对齐 secret 扫描排除集，
+# 并把匹配从「全路径子串」收紧为「词级/分隔符 token」匹配（消除 keyboard/keyword/monkey 等含 "key"
+# 子串的合法文档名潜在误排 · 实测 0 漏排 / 0 误排 · 度量见 coding/calibration_evidence.md）。
+# 保守安全侧取舍：词级匹配下 secret-management-guide.md 等「以敏感词为独立 token」的合法主题文档仍
+# 会被排除——deny-list 是回退 grep 源域的纵深防御，宁可多排敏感词文档也不漏排真敏感文件。
+DENY_DIR_SEGMENTS = (".git", ".aws", ".ssh", ".gnupg")  # 目录路径段（精确等值即排除）
+# 段（整段 or 其按 [-_. /] 切的 sub-token）精确等于以下词即排除（容多 token deny 词如 id_rsa）。
+DENY_NAME_TOKENS = (
+    "key", "secret", "token", "credential", "credentials",
+    "password", "passwd", "private",
+    "id_rsa", "id_dsa", "id_ed25519", "keystore",
+)
+# 敏感扩展名后缀（走 basename 后缀匹配 · 容 .env / .pem / 私钥/证书容器扩展名）。
+DENY_NAME_SUFFIXES = (".env", ".pem", ".key", ".p12", ".pfx", ".aws")
+# 由 DENY_NAME_SUFFIXES 派生的「敏感扩展名 stem」集合（去前导点 · 单一真相派生）。
+# 用于按 basename 的「点分量」逐段比对——捕获敏感扩展名作为 *内部* 点分量的形态
+# （.env.md / x.env.bak / app.pem.bak 等：末尾后缀是 .md/.bak 非 .env，靠纯后缀匹配会漏排）。
+# RM-121 PH-3 回归修复（v2）：RM-118 fixture 用 `.env.md` 代表「.env 敏感文件」，纯后缀
+# endswith 对其失败（结尾 .md）→ 漏排泄漏 .env 片段 → 破 AC-118-5。点分量比对补此缺口；
+# 同时不误排 keyboard.md→["keyboard","md"] / environment.md→["environment","md"] /
+# dev-env-setup.md→["dev-env-setup","md"]（"env" 被连字符并入 · 非独立点分量）。
+_DENY_EXT_STEMS = frozenset(s.lstrip(".") for s in DENY_NAME_SUFFIXES)
+
+# 关键词分词停用词（简单空白切分 + 去停用词 · 不造复杂 NLP · 占位待 RM-121）。
+STOPWORDS = {
+    "的", "了", "是", "在", "和", "与", "或", "怎么", "如何", "什么", "哪", "哪个", "哪些",
+    "a", "an", "the", "of", "to", "in", "is", "are", "how", "what", "which", "do", "does",
+    "for", "on", "and", "or", "with",
+}
+
+
+def eprint(*args):
+    print(*args, file=sys.stderr)
+
+
+def fail(code, msg):
+    """参数/内部错误：诊断走 stderr，按退出码退出（0/2/5 严格语义 · 不用 exit 1）。"""
+    eprint(f"wiki-query: {msg}")
+    sys.exit(code)
+
+
+def read_text(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def tokenize(question):
+    """简单分词：非字母数字/中文边界切分 + 去停用词 + 去太短词。不造复杂 NLP（占位待 RM-121）。"""
+    # 按非（字母数字 + CJK + 连字符/下划线）切分。
+    raw = re.split(r"[^\w一-鿿-]+", question)
+    toks = []
+    for t in raw:
+        t = t.strip()
+        if not t:
+            continue
+        low = t.lower()
+        if low in STOPWORDS:
+            continue
+        # 英文太短词（<=1 ASCII 字符）丢弃；CJK 单字保留（中文单字也可能有意义）。
+        if len(t) <= 1 and t.isascii():
+            continue
+        toks.append(t)
+    return toks
+
+
+# ── 复用既有 frontmatter 解析（参照 wiki-lint parse_frontmatter · 仅取 sources 所需） ──
+def parse_frontmatter(text):
+    """解析受限 schema 的 YAML frontmatter（key: value + 块列表 `  - item`）。
+    返回 dict；无/损坏 frontmatter 返回 None。逻辑对齐 wiki-lint parse_frontmatter。"""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    fm = {}
+    list_key = None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            return fm
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        stripped = line.strip()
+        if stripped.startswith("- ") and list_key:
+            fm[list_key].append(stripped[2:].strip())
+            continue
+        m = re.match(r"^([A-Za-z][\w-]*):\s*(.*)$", stripped)
+        if not m:
+            return None
+        key, value = m.group(1), m.group(2).strip()
+        if value == "":
+            fm[key] = []
+            list_key = key
+        else:
+            fm[key] = value
+            list_key = None
+    return None
+
+
+def resolve_link(target):
+    """[[concepts/promise]] → 'concepts/promise.md'（对齐 wiki-lint resolve_link）。"""
+    t = target.strip()
+    if not t.endswith(".md"):
+        t += ".md"
+    return t
+
+
+# ── 步骤① index 导航 ──
+def parse_index(wiki):
+    """读 <wiki>/index.md，解析每行 wikilink + 简述文本。
+    返回 [(page_rel_path, desc_line)]；index.md 不存在则返回 []。"""
+    index_path = os.path.join(wiki, "index.md")
+    if not os.path.isfile(index_path):
+        return []
+    entries = []
+    for line in read_text(index_path).splitlines():
+        m = WIKILINK_RE.search(line)
+        if not m:
+            continue
+        page = resolve_link(m.group(1))
+        entries.append((page, line.strip()))
+    return entries
+
+
+def score_candidate(tokens, page, desc):
+    """候选页与问题关键词的简单匹配分（标题/wikilink/简述文本命中数）。"""
+    hay = (page + " " + desc).lower()
+    return sum(1 for t in tokens if t.lower() in hay)
+
+
+# ── 词法召回底座（rg 优先 · 纯 Python 兜底） ──
+# 说明：环境若无独立 `rg` 二进制（如 rg 为 shell 函数包装），shutil.which 返回 None；
+# 此时退化为纯 Python 逐行扫描 .md 源（同语义词法召回），保证失败软化（永不空落）。
+# 真正的退化兜底（exit 5）只在连 corpus 都无法读取时触发（CLI-009 · RK-5）。
+
+def _walk_md_files(dirs):
+    """遍历 dirs 下全部 .md 文件（绝对/相对路径保持传入形态）。"""
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for root, _dnames, files in os.walk(d):
+            for fn in files:
+                if fn.endswith(".md"):
+                    yield os.path.join(root, fn)
+
+
+def rg_lines(token, dirs, rg_bin, max_count=5):
+    """词法召回 token 在 dirs 下的命中行（filePath:line:content）。
+    rg 可用走 rg；否则纯 Python 逐行扫描。返回 (lines, ok)；ok=False 表示底座彻底不可用。"""
+    if rg_bin is not None:
+        try:
+            r = subprocess.run(
+                [rg_bin, "-n", "--no-heading", "--fixed-strings",
+                 "--max-count", str(max_count), "--", token, *dirs],
+                capture_output=True, text=True)
+        except OSError:
+            r = None
+        if r is not None and r.returncode in (0, 1):  # 0=命中 1=无命中
+            return r.stdout.splitlines(), True
+        # rg 调用异常 → 落 Python 兜底（不直接判底座不可用）。
+    # 纯 Python 兜底逐行扫描。
+    out = []
+    any_readable = False
+    for fp in _walk_md_files(dirs):
+        try:
+            with open(fp, encoding="utf-8", errors="replace") as f:
+                any_readable = True
+                hits = 0
+                for i, line in enumerate(f, 1):
+                    if token in line:
+                        out.append(f"{fp}:{i}:{line.rstrip()}")
+                        hits += 1
+                        if hits >= max_count:
+                            break
+        except OSError:
+            continue
+    # 源域无任一可读 .md 文件 → 底座不可用（exit 5 退化兜底信号）。
+    return out, any_readable
+
+
+def rg_candidate_pages(wiki, tokens, rg_bin):
+    """词法召回候选页（相对 wiki 的 posix 路径）。rg 优先 · 纯 Python 兜底。"""
+    pages = set()
+    for t in tokens:
+        lines, _ok = rg_lines(t, [wiki], rg_bin)
+        for line in lines:
+            fp = line.split(":", 1)[0].strip()
+            if not fp.endswith(".md"):
+                continue
+            rel = os.path.relpath(fp, wiki).replace(os.sep, "/")
+            if rel.startswith(META_DIR + "/") or rel == "index.md":
+                continue
+            pages.add(rel)
+    return pages
+
+
+# ── 步骤③ 两跳溯源 ──
+def two_hop(wiki, page_rel):
+    """第一跳读命中页正文；第二跳读 frontmatter sources: 得源文件路径。
+    返回 (body, sources_list)；页不存在返回 (None, [])。"""
+    page_path = os.path.join(wiki, page_rel)
+    if not os.path.isfile(page_path):
+        return None, []
+    text = read_text(page_path)
+    fm = parse_frontmatter(text)
+    sources = []
+    if isinstance(fm, dict):
+        s = fm.get("sources")
+        if isinstance(s, list):
+            sources = [str(x).strip() for x in s if str(x).strip()]
+    return text, sources
+
+
+# ── 步骤④ 回退 grep（敏感目录排除） ──
+def grep_source_domain(state, wiki):
+    """回退 grep 的源域 = 被路由 corpus 对应源域（state.json source_dirs），
+    缺 state 时退化为 wiki 目录本身。"""
+    if isinstance(state, dict):
+        dirs = [d for d in state.get("source_dirs", []) if d and os.path.isdir(d)]
+        if dirs:
+            return dirs
+    return [wiki]
+
+
+def is_sensitive_path(path):
+    """敏感路径排除（CLI-011 · RM-121 PH-3 收紧为词级匹配 · 落实 LOW-1 + RK-1）：
+      ① 目录段精确等值命中 DENY_DIR_SEGMENTS（含 .git/.aws/.ssh/.gnupg）；
+      ② basename 敏感扩展名命中：末尾后缀（DENY_NAME_SUFFIXES）∪ 任一 *点分量* 等于敏感扩展名
+         stem（_DENY_EXT_STEMS）——后者捕获 .env.md / x.env.bak 等内部点分量形态（v2 回归修复）；
+      ③ 任一路径段（整段 or 其按 [-_./ ] 切的 sub-token）精确等于 DENY_NAME_TOKENS 中词。
+    词级匹配（等值非子串）消除 keyboard/keyword/monkey 等含 'key' 子串合法文档名的误排，
+    同时整段比对保留 id_rsa 等多 token 私钥名命中（不被 '_' 切碎漏排）。"""
+    norm = path.replace(os.sep, "/")
+    segments = [s for s in norm.split("/") if s]
+    # ① 目录段精确等值。
+    for seg in segments:
+        if seg in DENY_DIR_SEGMENTS:
+            return True
+    base_low = segments[-1].lower() if segments else norm.lower()
+    # ② basename 敏感扩展名：先末尾后缀，再按点分量比对（捕获内部点分量如 .env.md）。
+    for suf in DENY_NAME_SUFFIXES:
+        if base_low.endswith(suf):
+            return True
+    # 点分量逐段等值：.env.md → ["", "env", "md"]，"env" ∈ stems → 排除；
+    # keyboard.md → ["keyboard", "md"]、environment.md → ["environment", "md"]、
+    # dev-env-setup.md → ["dev-env-setup", "md"] 均无独立 "env" 分量 → 不误排。
+    for part in base_low.split("."):
+        if part in _DENY_EXT_STEMS:
+            return True
+    # ③ 词级 token 匹配：整段 + 段内 sub-token 等值（非子串包含）。
+    for seg in segments:
+        seg_low = seg.lower()
+        if seg_low in DENY_NAME_TOKENS:
+            return True
+        for sub in re.split(r"[-_./ ]+", seg_low):
+            if sub in DENY_NAME_TOKENS:
+                return True
+    return False
+
+
+def fallback_grep(tokens, dirs, rg_bin, budget):
+    """命令内部自动回退 grep：被路由 corpus 源域 + 排除敏感目录。
+    rg 优先 · 纯 Python 兜底。返回 (hits_text, had_base)；
+    had_base=False 仅在 corpus 源域无任一可读文件时 = 退化兜底信号（exit 5）。"""
+    if not tokens:
+        return "", True
+    lines = []
+    seen = set()
+    had_base = False
+    for t in tokens:
+        token_lines, ok = rg_lines(t, dirs, rg_bin)
+        had_base = had_base or ok
+        for line in token_lines:
+            # 形如 path:line:content —— 排除敏感路径命中（CLI-011 双匹配）。
+            fp = line.split(":", 1)[0]
+            if is_sensitive_path(fp):
+                continue
+            if line in seen:
+                continue
+            seen.add(line)
+            lines.append(line)
+    text = "\n".join(lines)
+    if len(text) > budget:
+        text = text[:budget].rstrip() + "\n…（已按 --budget 截断 · 调整关键词或加大 budget）"
+    return text, had_base
+
+
+# ── 输出组装 ──
+HINT_HIT = ("以上为 wiki 两跳溯源结果，已含原文出处。"
+            "（wiki 为提炼改写、词法召回有损。）")
+HINT_FALLBACK = ("wiki 未覆盖本查询，已自动回退 grep 原文（上方）；"
+                 "如需更全可调整关键词再查。")
+FALLBACK_HEADER = "⚠ wiki 未覆盖，以下为原文检索（grep 回退）"
+NO_FALLBACK_NOTE = "无命中（--no-fallback 诊断模式）：wiki 未覆盖本查询，回退已关闭，无原文检索。"
+
+
+def build_hit_output(wiki, hits, budget):
+    """命中态输出：① 两跳引用 + 命中页正文（输出做全）③ 末尾在band 提示。
+    --budget 裁剪只截尾部低相关页正文，不删命中段头 + 提示（RK-2）。"""
+    parts = []
+    parts.append(f"# wiki 命中（{len(hits)} 页 · 两跳溯源）\n")
+    # 高相关页在前；尾部低相关页在预算紧张时只截其正文。
+    used = 0
+    for i, (page, body, sources) in enumerate(hits):
+        first_hop = os.path.join(wiki, page).replace(os.sep, "/")
+        src_line = "、".join(sources) if sources else "（页 frontmatter 无 sources · 第二跳断链）"
+        head = (f"## 命中页 {i + 1}：{page}\n"
+                f"- 第一跳（命中页）：{first_hop}\n"
+                f"- 第二跳（源文件 sources）：{src_line}\n")
+        parts.append(head)
+        used += len(head)
+        # 正文：预算够则全文（输出做全）；尾部页预算紧张则截其正文（不腰斩高相关首页）。
+        remain = budget - used
+        if i == 0 or remain > 600:
+            shown = body
+            if i > 0 and len(body) > remain and remain > 0:
+                shown = body[:remain].rstrip() + "\n…（尾部低相关页正文已按 --budget 截断）"
+            parts.append(shown + "\n")
+            used += len(shown)
+        else:
+            parts.append("（尾部低相关页正文已按 --budget 省略 · 调整关键词或加大 budget 查看）\n")
+    parts.append("\n---\n" + HINT_HIT)
+    return "\n".join(parts)
+
+
+def build_fallback_output(grep_text):
+    """回退态输出：② grep 回退段（标注头 + filePath:line）③ 末尾在band 提示。"""
+    body = grep_text if grep_text else "（grep 回退无命中 · 调整关键词再查）"
+    return f"{FALLBACK_HEADER}\n\n{body}\n\n---\n{HINT_FALLBACK}"
+
+
+def load_state(wiki):
+    p = os.path.join(wiki, META_DIR, STATE_FILE)
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="wiki-query", add_help=True,
+        description="把 WK-Q 四步查询塌缩为单命令（index 导航→rg 补候选→两跳溯源→断链回退 grep）。")
+    ap.add_argument("question", nargs="?", help="自然语言查询（必填 · 空 → exit 2）")
+    ap.add_argument("--wiki", default="wiki",
+                    help="corpus 路由 · 仓库根相对路径 · 默认 wiki/（不存在目录 → exit 2 · CLI-012）")
+    ap.add_argument("--budget", type=int, default=DEFAULT_BUDGET,
+                    help=f"输出字符预算上限 · 缺省 {DEFAULT_BUDGET}（RM-121 据本项目 wiki 正文"
+                         "median≈2192/p90≈2984 实测校准 · 约容 3.6 中位页 · 首页恒全文不腰斩 · PH-1）")
+    ap.add_argument("--no-fallback", action="store_true",
+                    help="关命令内部 grep 回退 · 仅诊断/测试用 · 默认不带=回退开")
+    args = ap.parse_args()
+
+    # ── 参数校验（exit 2 · CLI-008/012 诚实报错） ──
+    if args.question is None or not args.question.strip():
+        fail(2, "缺少或空的查询问题（位置参数 <问题> 必填）")
+    if args.budget <= 0:
+        fail(2, f"--budget 须为正整数：{args.budget}")
+    wiki = args.wiki
+    if not os.path.isdir(wiki):
+        fail(2, f"corpus 目录不存在：{wiki}（CLI-012 诚实报错 · 不软化）")
+
+    question = args.question.strip()
+    tokens = tokenize(question)
+    rg_bin = shutil.which("rg")
+    state = load_state(wiki)
+
+    try:
+        # ── 步骤①② 候选页（index 导航 ∪ rg 补候选） ──
+        index_entries = parse_index(wiki)
+        scored = []
+        for page, desc in index_entries:
+            s = score_candidate(tokens, page, desc)
+            if s > 0:
+                scored.append((s, page))
+        index_pages = {p for _s, p in scored}
+
+        rg_pages = rg_candidate_pages(wiki, tokens, rg_bin)  # rg 优先 · 纯 Python 兜底
+
+        # ── 步骤③ 两跳溯源（命中页正文 + frontmatter sources） ──
+        # index 命中按分降序在前（高相关），rg-only 候选续后（低相关）。
+        ordered = [p for _s, p in sorted(scored, key=lambda x: -x[0])]
+        for p in sorted(rg_pages):
+            if p not in index_pages:
+                ordered.append(p)
+
+        hits = []
+        any_sources = False
+        for page in ordered:
+            body, sources = two_hop(wiki, page)
+            if body is None:
+                continue
+            if sources:
+                any_sources = True
+            hits.append((page, body, sources))
+
+        # ── 步骤④ 命中判据 + 断链/未覆盖回退 ──
+        # 命中页数==0（未命中）或候选页存在但全无可解析 sources（两跳断链）→ 回退。
+        # RM-121 实测校准（PH-2 · OQ-3=保持布尔）：本项目语料假覆盖率度量显示，词法 OR 召回下
+        # 离题查询（如「React useState」「kubernetes ingress」）会因 incidental 公共 token（hook/
+        # 路由/Python 等本项目高频词）命中页而判 covered（存在假覆盖）。但仍保持此布尔判据——
+        # 加最小相关性分阈值会过度回退、伤窄查询采纳率（与 ADR-009 失败软化基调相悖）；假覆盖时
+        # agent 仍拿到 wiki 页指针 + 在band「如需全部出处再 grep」提示可自行回退，代价可控。
+        # 度量证据见 coding/calibration_evidence.md。
+        covered = len(hits) > 0 and any_sources
+
+        if covered:
+            print(build_hit_output(wiki, hits, args.budget))
+            sys.exit(0)
+
+        # 未覆盖/断链。
+        if args.no_fallback:
+            # 不回退但 exit 0 + 显式「无命中」标注（非裸空 · 非 isError · COND-2）。
+            print(NO_FALLBACK_NOTE)
+            sys.exit(0)
+
+        # 默认回退开：命令内部自动回退 grep（被路由 corpus 源域 + 排除敏感目录）。
+        dirs = grep_source_domain(state, wiki)
+        grep_text, had_base = fallback_grep(tokens, dirs, rg_bin, args.budget)
+        if not had_base:
+            # 回退底座不可用（corpus 源域无任一可读文件 · rg 与 Python 扫描均无路径）
+            # 且 wiki 两跳未覆盖 → 退化兜底（exit 5 诚实报内部错误 · 不静默）。
+            fail(5, "回退 grep 底座不可用（corpus 源域无任一可读源文件），"
+                    "且 wiki 两跳未覆盖——无可降级路径（CLI-009 退化兜底）")
+        print(build_fallback_output(grep_text))
+        sys.exit(0)
+
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001 — 任何未预期错误按内部错误退出（不用 exit 1）
+        fail(5, f"内部错误：{e}")
+
+
+if __name__ == "__main__":
+    main()

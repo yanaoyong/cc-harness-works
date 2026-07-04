@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""wiki-rescan — 源变更检测与摄取状态管理（纯标准库，零依赖）。
+
+职责（ADR-002 §2/§3）：
+  --init          脚手架 wiki 目录 + state.json 基线（--ext 指定源扩展名，默认 .md）
+  （默认）        输出变更清单：git diff 优先，manifest SHA256 兜底
+  --all           列出全部源文件（首次全量用）
+  --begin-batch   登记当前批次（含 log.md append-only 快照，供 wiki-lint 校验）
+  --commit-batch  批次过门禁后，把批内文件的 SHA256 写回 manifest 并清批
+  --forget        源文件删除后从 manifest 摘除（页面清理由 agent 先行完成）
+  --set-ext       替换既有 wiki 的源扩展名列表（如 --set-ext .md .pdf .docx）
+
+非 .md 源（PDF/DOCX）只入 manifest 做变更跟踪；摄取前由编排方跑
+wiki-extract 生成文本抽取稿（见该脚本头注释）。代码文件刻意不支持。
+
+纪律：stdout 只输出 JSON；诊断走 stderr。
+退出码：0 成功 / 2 参数错误 / 5 内部错误。
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+
+META_DIR = "_meta"
+STATE_FILE = "state.json"
+
+INDEX_TEMPLATE = """# Wiki Index
+
+> 导航入口。每个 wiki 页面都必须从本页经 wikilink 可达（lint 检查 2）。
+"""
+
+LOG_TEMPLATE = """# Ingest Log（append-only）
+
+> 每批摄取追加一节 `## batch:<id> | <UTC 时间> | model:<模型>`，只增不改（lint 检查 5）。
+"""
+
+REVIEWS_TEMPLATE = """# Reviews（矛盾/重复/缺页待办）
+
+> 摄取中发现与既有页面矛盾/重复/缺页时在此登记，留人裁决，禁止静默改写既有结论。
+> 条目格式（lint 检查 6）：顶层 `- type: …` 起一条，必须含 source、affected-pages
+> 与 status（只允许 open / resolved，说明写在 note: 键）。
+"""
+
+
+def eprint(*args):
+    print(*args, file=sys.stderr)
+
+
+def fail(code, msg):
+    eprint(f"wiki-rescan: {msg}")
+    sys.exit(code)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def state_path(wiki):
+    return os.path.join(wiki, META_DIR, STATE_FILE)
+
+
+def load_state(wiki):
+    p = state_path(wiki)
+    if not os.path.isfile(p):
+        fail(2, f"state 不存在：{p}（先跑 --init）")
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_state(wiki, state):
+    with open(state_path(wiki), "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
+def norm_ext(ext):
+    """'.PDF' / 'pdf' → '.pdf'。"""
+    e = ext.strip().lower()
+    return e if e.startswith(".") else "." + e
+
+
+def list_sources(state):
+    """source_dirs 下全部命中 extensions 的文件（按 basename 应用 exclude），
+    排序去重。extensions 缺省 ['.md']（兼容旧 state）。"""
+    exclude = set(state.get("exclude", []))
+    exts = set(state.get("extensions", [".md"]))
+    out = set()
+    for d in state["source_dirs"]:
+        if not os.path.isdir(d):
+            eprint(f"wiki-rescan: 源目录不存在，跳过：{d}")
+            continue
+        for root, _dirs, files in os.walk(d):
+            for fn in files:
+                if os.path.splitext(fn)[1].lower() in exts and fn not in exclude:
+                    out.add(os.path.normpath(os.path.join(root, fn)))
+    return sorted(out)
+
+
+def git_head():
+    try:
+        r = subprocess.run(["git", "rev-parse", "HEAD"],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except OSError:
+        pass
+    return None
+
+
+def git_changed_since(commit, dirs):
+    r = subprocess.run(
+        ["git", "diff", "--name-only", commit, "--", *dirs],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "git diff failed")
+    return {os.path.normpath(line) for line in r.stdout.splitlines() if line.strip()}
+
+
+def detect(state, all_=False):
+    files = list_sources(state)
+    manifest = state.get("manifest", {})
+    deleted = sorted(set(manifest) - set(files))
+    if all_:
+        return {"mode": "all", "changed": files, "new": [], "deleted": deleted}
+
+    new = [f for f in files if f not in manifest]
+    known = [f for f in files if f in manifest]
+    mode = "manifest"
+    candidates = known
+    last = state.get("last_commit")
+    if last:
+        try:
+            git_set = git_changed_since(last, state["source_dirs"])
+            candidates = [f for f in known if f in git_set]
+            mode = "git"
+        except (RuntimeError, OSError) as e:
+            eprint(f"wiki-rescan: git diff 不可用（{e}），回退 manifest 比对")
+    # git 只做候选收窄，SHA256 是事实判据（兜底兼防 git 与 manifest 基线错位）
+    changed = [f for f in candidates if sha256_file(f) != manifest[f]]
+    return {"mode": mode, "changed": changed, "new": new, "deleted": deleted}
+
+
+def cmd_init(wiki, source_dirs, extensions=None):
+    if os.path.isfile(state_path(wiki)):
+        fail(2, f"state 已存在：{state_path(wiki)}（不重复 init）")
+    for sub in ("concepts", "entities", "sources", META_DIR):
+        os.makedirs(os.path.join(wiki, sub), exist_ok=True)
+    scaffolded = []
+    for rel, tpl in (("index.md", INDEX_TEMPLATE),
+                     (os.path.join(META_DIR, "log.md"), LOG_TEMPLATE),
+                     (os.path.join(META_DIR, "reviews.md"), REVIEWS_TEMPLATE)):
+        p = os.path.join(wiki, rel)
+        if not os.path.exists(p):
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(tpl)
+            scaffolded.append(rel)
+    state = {
+        "source_dirs": [os.path.normpath(d) for d in source_dirs],
+        "exclude": ["ATTRIBUTION.md"],
+        "extensions": sorted({norm_ext(e) for e in (extensions or [".md"])}),
+        "last_commit": None,
+        "manifest": {},
+        "current_batch": None,
+    }
+    save_state(wiki, state)
+    return {"action": "init", "wiki": wiki, "state": state_path(wiki),
+            "scaffolded": scaffolded}
+
+
+def cmd_set_ext(wiki, state, extensions):
+    """替换源扩展名列表。收窄时若 manifest 中有被排除的扩展名则拒绝
+    （先 --forget，避免检查 4 的覆盖目标悄悄缩水）。"""
+    exts = sorted({norm_ext(e) for e in extensions})
+    orphaned = [f for f in state.get("manifest", {})
+                if os.path.splitext(f)[1].lower() not in exts]
+    if orphaned:
+        fail(2, "manifest 中已有这些扩展名的源，收窄前先 --forget："
+                + ", ".join(orphaned))
+    state["extensions"] = exts
+    save_state(wiki, state)
+    return {"action": "set-ext", "extensions": exts}
+
+
+def cmd_begin_batch(wiki, state, batch_id, files):
+    if state.get("current_batch"):
+        fail(2, f"已有未提交批次 {state['current_batch']['id']}（先 --commit-batch）")
+    norm = sorted({os.path.normpath(f) for f in files})
+    missing = [f for f in norm if not os.path.isfile(f)]
+    if missing:
+        fail(2, f"批内文件不存在：{', '.join(missing)}")
+    log_path = os.path.join(wiki, META_DIR, "log.md")
+    data = b""
+    if os.path.isfile(log_path):
+        with open(log_path, "rb") as f:
+            data = f.read()
+    state["current_batch"] = {
+        "id": str(batch_id),
+        "files": norm,
+        "log_prefix_bytes": len(data),
+        "log_prefix_sha256": hashlib.sha256(data).hexdigest(),
+        "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    save_state(wiki, state)
+    return {"action": "begin-batch", "batch": state["current_batch"]}
+
+
+def cmd_forget(wiki, state, files):
+    norm = sorted({os.path.normpath(f) for f in files})
+    unknown = [f for f in norm if f not in state.get("manifest", {})]
+    if unknown:
+        fail(2, f"不在 manifest 中：{', '.join(unknown)}")
+    still_there = [f for f in norm if os.path.isfile(f)]
+    if still_there:
+        fail(2, f"文件仍然存在，--forget 只用于已删除的源：{', '.join(still_there)}")
+    for f in norm:
+        del state["manifest"][f]
+    save_state(wiki, state)
+    return {"action": "forget", "forgotten": norm,
+            "manifest_size": len(state["manifest"])}
+
+
+def cmd_commit_batch(wiki, state):
+    batch = state.get("current_batch")
+    if not batch:
+        fail(2, "没有进行中的批次")
+    for f in batch["files"]:
+        if not os.path.isfile(f):
+            fail(5, f"批内文件丢失：{f}")
+        state["manifest"][f] = sha256_file(f)
+    state["last_commit"] = git_head()
+    state["current_batch"] = None
+    save_state(wiki, state)
+    return {"action": "commit-batch", "batch_id": batch["id"],
+            "manifest_size": len(state["manifest"]),
+            "last_commit": state["last_commit"]}
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="wiki-rescan", add_help=True)
+    ap.add_argument("--wiki", required=True, help="wiki 根目录")
+    ap.add_argument("--init", action="store_true")
+    ap.add_argument("--source-dir", action="append", default=[])
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--begin-batch", metavar="ID")
+    ap.add_argument("--files", nargs="+", default=[])
+    ap.add_argument("--commit-batch", action="store_true")
+    ap.add_argument("--forget", action="store_true")
+    ap.add_argument("--ext", action="append", default=[],
+                    help="与 --init 连用：源扩展名（可重复，默认 .md）")
+    ap.add_argument("--set-ext", nargs="+", metavar="EXT",
+                    help="替换既有 wiki 的源扩展名列表")
+    args = ap.parse_args()
+
+    modes = sum([args.init, bool(args.begin_batch), args.commit_batch,
+                 args.forget, bool(args.set_ext)])
+    if modes > 1:
+        fail(2, "--init / --begin-batch / --commit-batch / --forget / --set-ext 互斥")
+    if args.ext and not args.init:
+        fail(2, "--ext 只与 --init 连用（既有 wiki 用 --set-ext）")
+
+    try:
+        if args.init:
+            if not args.source_dir:
+                fail(2, "--init 需要至少一个 --source-dir")
+            result = cmd_init(args.wiki, args.source_dir, args.ext)
+        elif args.set_ext:
+            result = cmd_set_ext(args.wiki, load_state(args.wiki), args.set_ext)
+        elif args.begin_batch:
+            if not args.files:
+                fail(2, "--begin-batch 需要 --files")
+            result = cmd_begin_batch(args.wiki, load_state(args.wiki),
+                                     args.begin_batch, args.files)
+        elif args.commit_batch:
+            result = cmd_commit_batch(args.wiki, load_state(args.wiki))
+        elif args.forget:
+            if not args.files:
+                fail(2, "--forget 需要 --files")
+            result = cmd_forget(args.wiki, load_state(args.wiki), args.files)
+        else:
+            result = detect(load_state(args.wiki), all_=args.all)
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001 — 任何未预期错误都按内部错误退出
+        fail(5, f"内部错误：{e}")
+
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

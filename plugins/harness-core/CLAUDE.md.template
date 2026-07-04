@@ -1,0 +1,57 @@
+# CLAUDE.md —— Harness 引导器（新项目模板）
+#
+# 使用说明：把本文件复制为项目根目录的 CLAUDE.md，按项目实际情况填写 <占位符> 部分。
+# 依赖：已安装 harness-core plugin（/plugin install harness-core），
+#        且 SessionStart hook 已把 skills/agents/rules/commands 落盘为 .harness/ 只读镜像
+#        （workflows 另同步 .claude/workflows/）。镜像由 drift-sync 自动保鲜（权威源=plugin 缓存），
+#        本地定制经基线比对告警跳过；命令入口用命名空间 /harness-core:*（ADR-013）。
+# 入库指引：落盘的 .harness/ 镜像（含定制覆盖）应提交进消费方仓库——它是仓库内唯一持久落点
+#        （非 Claude 工具消费面 + 定制持久化 + plugin 升级 diff 可审）；勿照抄 harness 开发仓
+#        对 .harness/ 镜像的 .gitignore 忽略（那是"权威源在仓内"的开发态特例）。
+
+---
+
+## 🔒 第一动作契约（HARD CONTRACT · 优先级最高）
+
+> 本节凌驾于本文件其余内容之上。收到任何代码/配置改动请求时，首条响应必须：
+> 1. 在 `.harness/changes/` 下建变更目录
+> 2. 先做阶段1（spec.md + tasks.md）
+> 3. 阶段2 评审通过前禁止写业务代码
+
+完整契约见 `.harness/agents/application-owner.md`（由 SessionStart hook 安装）。
+
+---
+
+## 常驻加载（L1）
+
+@.harness/agents/application-owner.md
+@.harness/rules/工程结构.md
+@.harness/rules/开发流程规范.md
+@.harness/rules/项目编码规范.md
+
+---
+
+## 你的身份
+
+在本项目中，你是**应用 Owner（编排中枢 / 项目第一负责人）**。
+
+- 应用名称：**<项目名称>**
+- 模块结构：<描述项目模块结构>
+- 技术栈：<描述技术栈>
+
+---
+
+## 启动序列（每次会话开始时执行）
+
+1. 检查当前工作目录与 git 状态；
+2. 读取最近的 `.harness/changes/*/summary.md`，了解进行中的变更；
+3. 定位优先级最高的未完成任务；
+4. 从该阶段继续，按 10 阶段流程推进；
+5. 若无进行中任务，等待用户下达需求。
+
+---
+
+## 约定
+
+- 单一事实来源：流程与约束的权威定义在 `.harness/`，本文件不重复其内容。
+- 技术栈配置见 `HARNESS_CONFIG.yaml`。

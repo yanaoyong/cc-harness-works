@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""wiki-extract — 非 .md 源的确定性文本抽取（PDF/DOCX → markdown 抽取稿）。
+
+定位（ADR-002 升级路径"解析工具单点引入"）：摄取会话的便宜模型不直接
+"看"PDF——视觉路径未验证且贵。编排方在批循环里先跑本脚本，把 PDF/DOCX
+抽成纯文本稿放进 <wiki>/_meta/extracted/，摄取会话读抽取稿、页面
+frontmatter 的 sources 仍指原始文件（真源；_meta 不算 wiki 页面，lint
+不收录抽取稿）。
+
+支持：
+  .pdf   外部工具 pdftotext（poppler-utils；唯一的可选外部依赖，
+         缺失时退出码 6 诚实报错，不静默降级）
+  .docx  纯 stdlib（zipfile + word/document.xml）
+
+用法：wiki-extract --wiki <W> <file.pdf> [file.docx ...]
+抽取稿路径：<W>/_meta/extracted/<源路径，分隔符替换为 __>.md（确定性，
+重复运行覆盖；源删除后由编排方连同页面一起清理）。
+
+纪律：stdout 只输出 JSON；诊断走 stderr。
+退出码：0 成功 / 2 参数错误或不支持的扩展名 / 5 抽取失败 / 6 能力缺失
+（pdftotext 不可用）。扫描件 PDF 无 OCR——抽出空文本按 5 处理。
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import zipfile
+import xml.etree.ElementTree as ET
+
+META_DIR = "_meta"
+EXTRACTED_DIR = "extracted"
+SUPPORTED = {".pdf", ".docx"}
+DOCX_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def eprint(*args):
+    print(*args, file=sys.stderr)
+
+
+def fail(code, msg):
+    eprint(f"wiki-extract: {msg}")
+    sys.exit(code)
+
+
+def extract_pdf(path):
+    tool = shutil.which("pdftotext")
+    if not tool:
+        fail(6, "pdftotext 不可用（apt: poppler-utils）——PDF 抽取是"
+                "唯一的可选外部依赖，不做静默降级")
+    r = subprocess.run([tool, "-enc", "UTF-8", path, "-"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        fail(5, f"pdftotext 失败：{path}：{r.stderr.strip()}")
+    return r.stdout
+
+
+def extract_docx(path):
+    try:
+        with zipfile.ZipFile(path) as z:
+            xml_data = z.read("word/document.xml")
+    except (zipfile.BadZipFile, KeyError) as e:
+        fail(5, f"docx 解析失败：{path}：{e}")
+    root = ET.fromstring(xml_data)
+    paragraphs = []
+    for p in root.iter(f"{DOCX_NS}p"):
+        text = "".join(t.text or "" for t in p.iter(f"{DOCX_NS}t"))
+        paragraphs.append(text)
+    return "\n\n".join(paragraphs)
+
+
+def sidecar_path(wiki, source):
+    slug = os.path.normpath(source).replace(os.sep, "__")
+    return os.path.join(wiki, META_DIR, EXTRACTED_DIR, slug + ".md")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="wiki-extract")
+    ap.add_argument("--wiki", required=True, help="wiki 根目录")
+    ap.add_argument("files", nargs="+", help="待抽取的 PDF/DOCX 源文件")
+    args = ap.parse_args()
+    if not os.path.isdir(os.path.join(args.wiki, META_DIR)):
+        fail(2, f"不是 wiki 根（缺 {META_DIR}/）：{args.wiki}")
+
+    results = []
+    for f in args.files:
+        ext = os.path.splitext(f)[1].lower()
+        if ext not in SUPPORTED:
+            fail(2, f"不支持的扩展名 {ext!r}（支持 {'/'.join(sorted(SUPPORTED))}；"
+                    f".md 无需抽取，代码文件刻意不支持）：{f}")
+        if not os.path.isfile(f):
+            fail(2, f"源文件不存在：{f}")
+        text = extract_pdf(f) if ext == ".pdf" else extract_docx(f)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        if not text:
+            fail(5, f"抽取结果为空（扫描件 PDF 无 OCR？）：{f}")
+        out = sidecar_path(args.wiki, f)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(f"<!-- 抽取稿，工具产物勿手编。原始源：{os.path.normpath(f)} -->\n\n")
+            fh.write(text + "\n")
+        results.append({"source": os.path.normpath(f),
+                        "extract": out.replace(os.sep, "/"),
+                        "chars": len(text)})
+    print(json.dumps({"action": "extract", "results": results},
+                     ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

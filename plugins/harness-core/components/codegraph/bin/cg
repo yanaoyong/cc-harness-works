@@ -1,0 +1,156 @@
+#!/bin/sh
+# cg — thin adapter over the CodeGraph CLI (Skill-over-CLI, v1 spike).
+#
+# Only normalization, no business logic:
+#   - choose runtime: `codegraph` on PATH (official bundle), else dev mode
+#     (CODEGRAPH_NODE + CODEGRAPH_DIST, requires Node >= 22.5)
+#   - run inside the project dir ($CG_PROJECT, default: cwd)
+#   - init check for query commands; stable exit codes
+#   - append --json for commands whose structured output we consume
+#   - ambiguity hint: callers/callees/impact are NAME-addressed (they union all
+#     same-named definitions). When the symbol has >1 definition we print a
+#     warning to STDERR (stdout stays pure JSON) so the agent sees the false-
+#     positive risk even without reading the skill. Disable with CG_NO_HINT=1.
+#     (Why this matters: on nestjs/nest, 68% of callable symbols collide on name
+#     — see docs/poc/codegraph-precision-eval.md.)
+#
+# Commands needing NO analysis runtime: `doctor` (diagnose), `install-skill`
+# (copy SKILL.md into <target>/.claude/skills/codegraph/). All others resolve a
+# runtime lazily and exit 10 if none is available.
+#
+# Env:
+#   CODEGRAPH_DIST  path to dist/bin/codegraph.js (dev/source mode)
+#   CODEGRAPH_NODE  node runner for dev mode (default: node), e.g. "npx -y node@22"
+#   CG_PROJECT      project dir to operate in (default: current dir)
+#   CG_NO_HINT      set to 1 to suppress the ambiguity hint on callers/callees/impact
+#
+# Exit codes:
+#   0  ok        10 RUNTIME_MISSING   11 NOT_INITIALIZED
+#   13 CG_CLI_ERROR                    2 usage error
+set -eu
+
+# Optional local config next to this script (keeps the skill call-site env-free):
+#   CODEGRAPH_DIST / CODEGRAPH_NODE / CG_PROJECT can be set in cg.env
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+[ -f "$SELF_DIR/cg.env" ] && . "$SELF_DIR/cg.env"
+
+CG_PROJECT="${CG_PROJECT:-$PWD}"
+die() { printf 'cg: %s\n' "$2" >&2; exit "$1"; }
+
+# --- runtime resolution (non-fatal; diagnosed lazily) -----------------------
+# doctor / install-skill don't need the analysis runtime, so resolution must not
+# die here — commands that actually invoke CodeGraph call need_runtime first.
+if command -v codegraph >/dev/null 2>&1; then
+  run_native="yes"
+elif [ -n "${CODEGRAPH_DIST:-}" ] && [ -f "${CODEGRAPH_DIST:-/nonexistent}" ]; then
+  run_native="no"
+else
+  run_native=""
+fi
+
+need_runtime() {
+  [ -n "$run_native" ] || die 10 "no CodeGraph runtime (need \`codegraph\` on PATH, or CODEGRAPH_DIST + Node>=22.5 via CODEGRAPH_NODE)"
+}
+
+invoke() {
+  if [ "$run_native" = "yes" ]; then
+    ( cd "$CG_PROJECT" && codegraph "$@" )
+  else
+    # word-split CODEGRAPH_NODE on purpose (e.g. "npx -y node@22")
+    # shellcheck disable=SC2086
+    ( cd "$CG_PROJECT" && ${CODEGRAPH_NODE:-node} "$CODEGRAPH_DIST" "$@" )
+  fi
+}
+
+is_initialized() { [ -d "$CG_PROJECT/.codegraph" ]; }
+
+# Count how many indexed symbols are named exactly $1 (best-effort, via query).
+# Used only to decide whether to warn about name-collision over-reporting.
+def_count() {
+  invoke query "$1" --limit 200 --json 2>/dev/null \
+    | grep -cF "\"name\": \"$1\"" 2>/dev/null || printf '0'
+}
+
+# Emit a stderr hint if the symbol $1 has >1 definition. Best-effort; never fails.
+ambiguity_hint() {
+  [ -z "${CG_NO_HINT:-}" ] || return 0
+  sym="$1"
+  # only for a bare symbol arg (skip if it looks like a flag or is empty)
+  [ -n "$sym" ] && [ "${sym#-}" = "$sym" ] || return 0
+  n=$(def_count "$sym" 2>/dev/null || printf '0')
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  [ "$n" -gt 1 ] && printf 'cg: ⚠ %s symbols named "%s" — results UNION all of them (likely false positives). Run `cg query %s` and keep only callers whose filePath matches the definition you mean.\n' "$n" "$sym" "$sym" >&2
+  return 0
+}
+
+# --- dispatch ---------------------------------------------------------------
+cmd="${1:-}"
+[ -n "$cmd" ] || die 2 "usage: cg <doctor|install-skill|status|query|callers|callees|impact|affected|files|explore|node|init|sync> [args]"
+shift || true
+
+case "$cmd" in
+  doctor)
+    if [ "$run_native" = "yes" ]; then
+      printf 'runtime: codegraph (PATH)\n'
+    elif [ "$run_native" = "no" ]; then
+      printf 'runtime: %s %s\n' "${CODEGRAPH_NODE:-node}" "$CODEGRAPH_DIST"
+    else
+      printf 'runtime: NONE — put `codegraph` on PATH, or set CODEGRAPH_DIST + CODEGRAPH_NODE (Node>=22.5)\n'
+    fi
+    if is_initialized; then
+      printf 'index:   initialized (%s/.codegraph)\n' "$CG_PROJECT"
+    else
+      printf 'index:   NOT initialized — run: cg init\n'
+    fi
+    ;;
+  install-skill)
+    # Copy the skill template into a target repo's .claude/skills/. No runtime needed.
+    target="${1:-$CG_PROJECT}"
+    [ -d "$target" ] || die 2 "install-skill: target '$target' is not a directory"
+    src="$SELF_DIR/../skill/SKILL.md"
+    [ -f "$src" ] || die 13 "install-skill: skill template not found at $src"
+    dest="$target/.claude/skills/codegraph"
+    mkdir -p "$dest"
+    # Inject this adapter's absolute path so the skill is runnable from any repo
+    # (the agent in the target repo has no idea where `cg` lives otherwise — see
+    # the live auto-trigger run, where every session had to grope for it).
+    cg_bin="$SELF_DIR/cg"
+    tmp="$dest/SKILL.md.tmp"
+    sed -e "s#plugins/harness-core/components/codegraph/bin/cg#$cg_bin#g" -e "s#@@CG_BIN@@#$cg_bin#g" "$src" > "$tmp" && mv "$tmp" "$dest/SKILL.md"
+    printf 'cg: installed skill -> %s/SKILL.md\n' "$dest"
+    printf 'cg: skill will invoke -> %s\n' "$cg_bin"
+    if [ -d "$target/.codegraph" ]; then
+      printf 'cg: index present — ready.\n'
+    else
+      printf 'cg: next: build the index ->  CG_PROJECT=%s cg init\n' "$target"
+    fi
+    ;;
+  status)
+    need_runtime
+    invoke status --json "$@" 2>/dev/null || die 13 "codegraph status failed"
+    ;;
+  callers|callees|impact)
+    is_initialized || die 11 "not initialized in $CG_PROJECT — run: cg init"
+    need_runtime
+    ambiguity_hint "${1:-}"
+    invoke "$cmd" "$@" --json 2>/dev/null || die 13 "codegraph $cmd failed"
+    ;;
+  query|affected|files)
+    is_initialized || die 11 "not initialized in $CG_PROJECT — run: cg init"
+    need_runtime
+    invoke "$cmd" "$@" --json 2>/dev/null || die 13 "codegraph $cmd failed"
+    ;;
+  explore|node)
+    is_initialized || die 11 "not initialized in $CG_PROJECT — run: cg init"
+    need_runtime
+    invoke "$cmd" "$@" || die 13 "codegraph $cmd failed"
+    ;;
+  init|sync|index|uninit|unlock)
+    need_runtime
+    invoke "$cmd" "$@" || die 13 "codegraph $cmd failed"
+    ;;
+  *)
+    need_runtime
+    invoke "$cmd" "$@" || die 13 "codegraph $cmd failed"
+    ;;
+esac

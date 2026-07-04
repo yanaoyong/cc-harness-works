@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""wiki-lint — 六项确定性硬门禁（ADR-002 §5，纯标准库，零依赖）。
+
+每批摄取后必须全绿才算完成（便宜模型的质量风险全靠这里兜）：
+  1. wikilinks   所有 [[wikilink]] 可解析（无断链）
+  2. orphans     无孤页（每页从 index.md 可达）
+  3. frontmatter 每页 frontmatter 完整（title/type/sources）且源文件路径真实存在
+  4. coverage    本批源文件（state.json current_batch，否则 manifest）都有 ≥1 页面引用
+  5. log         log.md 本批有新条目且只增不改（对照 begin-batch 时的快照）
+  6. reviews     reviews.md 条目格式合法（type/source/affected-pages/status 齐全，
+                 status ∈ open/resolved——表外值会让 review 工作流按 status: open 检索时漏检）
+
+纪律：stdout 只输出 JSON 报告；诊断走 stderr。
+退出码：0 全绿 / 1 有违规 / 2 参数错误 / 5 内部错误。
+源文件路径相对运行目录（仓库根）解析——请在仓库根运行。
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+
+META_DIR = "_meta"
+PAGE_TYPES = {"concept", "entity", "source"}
+REVIEW_TYPES = {"contradiction", "duplicate", "missing-page"}
+REVIEW_STATUSES = {"open", "resolved"}
+WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
+
+
+def eprint(*args):
+    print(*args, file=sys.stderr)
+
+
+def fail(code, msg):
+    eprint(f"wiki-lint: {msg}")
+    sys.exit(code)
+
+
+def read_text(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def wiki_pages(wiki):
+    """wiki 下全部页面（含 index.md，不含 _meta），返回相对 wiki 的 posix 路径。"""
+    pages = []
+    for root, dirs, files in os.walk(wiki):
+        dirs[:] = [d for d in dirs if d != META_DIR]
+        for fn in files:
+            if fn.endswith(".md"):
+                rel = os.path.relpath(os.path.join(root, fn), wiki)
+                pages.append(rel.replace(os.sep, "/"))
+    return sorted(pages)
+
+
+def resolve_link(target):
+    """[[concepts/promise]] / [[concepts/promise.md]] → 'concepts/promise.md'"""
+    t = target.strip()
+    if not t.endswith(".md"):
+        t += ".md"
+    return t
+
+
+def parse_frontmatter(text):
+    """解析受限 schema 的 YAML frontmatter：`key: value` + 块列表 `  - item`。
+    返回 dict；无 frontmatter 返回 None。"""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    fm = {}
+    list_key = None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            return fm
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        stripped = line.strip()
+        if stripped.startswith("- ") and list_key:
+            fm[list_key].append(stripped[2:].strip())
+            continue
+        m = re.match(r"^([A-Za-z][\w-]*):\s*(.*)$", stripped)
+        if not m:
+            return None  # 无法解析的行 → 视为 frontmatter 损坏
+        key, value = m.group(1), m.group(2).strip()
+        if value == "":
+            fm[key] = []
+            list_key = key
+        else:
+            fm[key] = value
+            list_key = None
+    return None  # 没有闭合的 ---
+
+
+def load_state(wiki):
+    p = os.path.join(wiki, META_DIR, "state.json")
+    if not os.path.isfile(p):
+        fail(2, f"state 不存在：{p}（先跑 wiki-rescan --init）")
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def check_wikilinks(wiki, pages, texts):
+    """检查 1：全部 wikilink 可解析。返回 (violations, links_graph)。"""
+    violations = []
+    graph = {}
+    existing = set(pages)
+    for page in pages:
+        targets = []
+        for m in WIKILINK_RE.finditer(texts[page]):
+            t = resolve_link(m.group(1))
+            targets.append(t)
+            if t not in existing:
+                violations.append(f"{page}: 断链 [[{m.group(1)}]] → {t} 不存在")
+        graph[page] = targets
+    return violations, graph
+
+
+def check_orphans(pages, graph):
+    """检查 2：每页从 index.md 经 wikilink 可达。"""
+    if "index.md" not in pages:
+        return ["index.md 不存在"]
+    seen = {"index.md"}
+    stack = ["index.md"]
+    while stack:
+        cur = stack.pop()
+        for t in graph.get(cur, []):
+            if t in graph and t not in seen:
+                seen.add(t)
+                stack.append(t)
+    return [f"{p}: 孤页（从 index.md 不可达）" for p in pages if p not in seen]
+
+
+def check_frontmatter(pages, texts):
+    """检查 3：frontmatter 完整、源路径真实存在。返回 (violations, page_sources)。"""
+    violations = []
+    page_sources = {}
+    for page in pages:
+        if page == "index.md":
+            continue
+        fm = parse_frontmatter(texts[page])
+        if fm is None:
+            violations.append(f"{page}: frontmatter 缺失或无法解析")
+            continue
+        if not str(fm.get("title", "")).strip():
+            violations.append(f"{page}: frontmatter 缺 title")
+        if fm.get("type") not in PAGE_TYPES:
+            violations.append(
+                f"{page}: type 非法（{fm.get('type')!r}，应为 {'/'.join(sorted(PAGE_TYPES))}）")
+        sources = fm.get("sources")
+        if not isinstance(sources, list) or not sources:
+            violations.append(f"{page}: frontmatter 缺 sources 列表")
+            sources = []
+        for s in sources:
+            if not os.path.isfile(s):
+                violations.append(f"{page}: 引用的源文件不存在：{s}")
+        page_sources[page] = [os.path.normpath(s) for s in sources]
+    return violations, page_sources
+
+
+def check_coverage(state, page_sources):
+    """检查 4：本批源文件都有 ≥1 页面引用（没有"吃了不吐"）。"""
+    batch = state.get("current_batch")
+    targets = batch["files"] if batch else sorted(state.get("manifest", {}))
+    referenced = {s for srcs in page_sources.values() for s in srcs}
+    return [f"源文件无任何页面引用：{f}"
+            for f in targets if os.path.normpath(f) not in referenced]
+
+
+def check_log(wiki, state):
+    """检查 5：log.md 本批有新条目且 append-only。"""
+    log_path = os.path.join(wiki, META_DIR, "log.md")
+    if not os.path.isfile(log_path):
+        return ["_meta/log.md 不存在"]
+    batch = state.get("current_batch")
+    if not batch:
+        return []  # 无进行中批次 → 本项无可校验内容
+    with open(log_path, "rb") as f:
+        data = f.read()
+    violations = []
+    n = batch["log_prefix_bytes"]
+    if len(data) < n or hashlib.sha256(data[:n]).hexdigest() != batch["log_prefix_sha256"]:
+        violations.append("_meta/log.md 历史区被改动（append-only 校验失败）")
+        appended = data.decode("utf-8", "replace")  # 历史已坏，整文找批次条目
+    else:
+        appended = data[n:].decode("utf-8", "replace")
+    marker = f"## batch:{batch['id']}"
+    if not any(line.strip().startswith(marker)
+               for line in appended.splitlines()):
+        violations.append(f"_meta/log.md 缺本批新条目（{marker} …）")
+    return violations
+
+
+def check_reviews(wiki):
+    """检查 6：reviews.md 每条有合法 type/status 与非空 source/affected-pages。"""
+    path = os.path.join(wiki, META_DIR, "reviews.md")
+    if not os.path.isfile(path):
+        return ["_meta/reviews.md 不存在"]
+    violations = []
+    entries = []
+    current = None
+    for i, line in enumerate(read_text(path).splitlines(), 1):
+        if re.match(r"^- ", line):
+            m = re.match(r"^- type:\s*(\S+)\s*$", line)
+            if not m:
+                violations.append(f"reviews.md:{i}: 顶层条目必须以 `- type: …` 开头")
+                current = None
+                continue
+            current = {"type": m.group(1), "_line": i}
+            entries.append(current)
+        elif current is not None and re.match(r"^\s+[\w-]+:", line):
+            k, _, v = line.strip().partition(":")
+            current[k.strip()] = v.strip()
+        elif line.strip() and not line.startswith((" ", "\t")):
+            current = None  # 标题/正文行结束当前条目
+    for e in entries:
+        where = f"reviews.md:{e['_line']}"
+        if e["type"] not in REVIEW_TYPES:
+            violations.append(
+                f"{where}: type 非法（{e['type']!r}，应为 {'/'.join(sorted(REVIEW_TYPES))}）")
+        for key in ("source", "affected-pages"):
+            if not e.get(key, "").strip():
+                violations.append(f"{where}: 缺 {key}")
+        status = e.get("status", "").strip()
+        if not status:
+            violations.append(f"{where}: 缺 status")
+        elif status not in REVIEW_STATUSES:
+            violations.append(
+                f"{where}: status 非法（{status!r}，应为 {'/'.join(sorted(REVIEW_STATUSES))}）")
+    return violations
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="wiki-lint")
+    ap.add_argument("--wiki", required=True, help="wiki 根目录")
+    args = ap.parse_args()
+    if not os.path.isdir(args.wiki):
+        fail(2, f"wiki 目录不存在：{args.wiki}")
+
+    try:
+        state = load_state(args.wiki)
+        pages = wiki_pages(args.wiki)
+        texts = {p: read_text(os.path.join(args.wiki, p)) for p in pages}
+
+        v1, graph = check_wikilinks(args.wiki, pages, texts)
+        v2 = check_orphans(pages, graph)
+        v3, page_sources = check_frontmatter(pages, texts)
+        v4 = check_coverage(state, page_sources)
+        v5 = check_log(args.wiki, state)
+        v6 = check_reviews(args.wiki)
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        fail(5, f"内部错误：{e}")
+
+    names = ["wikilinks", "orphans", "frontmatter", "coverage", "log", "reviews"]
+    all_v = [v1, v2, v3, v4, v5, v6]
+    report = {
+        "ok": not any(all_v),
+        "pages": len(pages),
+        "checks": [{"id": i + 1, "name": n, "ok": not v, "violations": v}
+                   for i, (n, v) in enumerate(zip(names, all_v))],
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    sys.exit(0 if report["ok"] else 1)
+
+
+if __name__ == "__main__":
+    main()
