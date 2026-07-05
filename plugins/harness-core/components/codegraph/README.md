@@ -22,6 +22,8 @@
 
 **降级语义**：无引擎时 `cg` 优雅降级——查询面（`query`/`callers`/`callees`/`impact`/`affected`/`files`）退出码 `10`（RUNTIME_MISSING）、功能不可用，但 `doctor`/`install-skill` 仍可用。codegraph 是**旁路查询工具、不进任一阶段门禁**（ADR-005），引擎缺位不阻断主流程，只是查询面用不上。
 
+**opt-in 显式授权例外**：经 `/harness-core:bootstrap` 一键（安装前展示动作、用户确认后执行）或 `HARNESS_AUTO_BOOTSTRAP=1` / config 开关（开关本身即用户显式授权）可自动安装引擎——两者均为用户显式授权、带 sha256 校验（fail-closed，校验失败拒绝执行），**仍非静默默认**（默认静默全自动已否决）；详见 [ADR-014](../../../../.harness/changes/feat-plugin-bootstrap-automation-20260705/coding/adr/ADR-014-optin-engine-install-exception.md)。
+
 > 操作手册见 **[USAGE.md](USAGE.md)** §1。下方「## 安装」是含 skill 安装/建索引的完整接入流程，引擎前置依赖的"是什么/为什么必须"以本段为权威声明。
 
 ## 结构

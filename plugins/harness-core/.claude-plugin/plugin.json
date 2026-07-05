@@ -1,6 +1,6 @@
 {
   "name": "harness-core",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Harness 核心方法论骨架（栈无关）：10 阶段 K 流程 + 元流程 M0-M5 双流程、5 角色 agent、流程层 skill 骨架、栈无关阶段8 门禁、旁路组件（codegraph / wiki-engine）。RM-141 落地：skill/agent/rule/component 文件已物理迁移进本 plugin 目录。",
   "author": {
     "name": "myharness"
