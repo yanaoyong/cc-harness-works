@@ -142,33 +142,53 @@ _write_mirror_baseline() {
 }
 
 # ------------------------------------------------------------
-# opt-in auto-bootstrap（T3 · spec B-1/B-2/B-3/B-4 · F-3/F-6 闭合）
-# 未设任一开关 → 本节全部函数零输出零副作用（AC-3 零回归）；
+# opt-out auto-bootstrap（ADR-015 · feat-firstrun-auto-bootstrap-20260705 翻转父卡 opt-in）
+# 默认 enabled（首会话默认自动 bootstrap · 无需任何开关）；仅显式关闭时 disabled——
+#   env HARNESS_AUTO_BOOTSTRAP ∈ {0,false}（大小写不敏感）∨ config `bootstrap.auto: false`。
+# retry 路径附加 .bootstrap_attempted 前置门（M-2c · 存量 pre-upgrade 项目零追溯 · AC-5a）；
 # 任何失败仅 log_warn 且恒 return 0（fail-open · AC-4），
 # 且不影响 .scaffold_initialized 落盘语义（B-3 哨兵独立）。
 # ------------------------------------------------------------
 
 _auto_bootstrap_enabled() {
-  # 开关（B-1 · 两者取或）：
-  #   ① 环境变量 HARNESS_AUTO_BOOTSTRAP=1（首会话唯一可行形态）
-  #   ② HARNESS_CONFIG.yaml 单行键 `bootstrap.auto: true`（次会话起持久形态 · OQ-4 决议：
-  #      grep 单行解析、bash 3.2 兼容、文件缺失即视为关；容忍前导空白与行尾注释）
-  # ⚠ 等价锚定（对称指认 · R4-02）：下方 grep 正则须与 session_start_bootstrap_hint.sh
-  #   opt-in 开关解析段（约 L138-144）的正则**完全一致**。两文件无法共享函数，以注释
-  #   互相指认——任一侧改动开关解析时必须同步另一侧，否则出现「T3 自动拉起、T4 拒绝
-  #   接力」的开关半开态（t6_test_run_v1 缺陷 #2）。
-  [ "${HARNESS_AUTO_BOOTSTRAP:-}" = "1" ] && return 0
-  [ -f "$TOP/HARNESS_CONFIG.yaml" ] || return 1
-  grep -E -q '^[[:space:]]*bootstrap\.auto[[:space:]]*:[[:space:]]*true[[:space:]]*(#.*)?$' \
-    "$TOP/HARNESS_CONFIG.yaml" 2>/dev/null
+  # 2 子句 opt-out 规则（M-1a · ADR-015 · 关信号命中即关，否则 enabled 默认开）：
+  #   ① env HARNESS_AUTO_BOOTSTRAP ∈ {0,false}（大小写不敏感）→ disabled；
+  #   ② env 非上述关值时，HARNESS_CONFIG.yaml 含单行键 `bootstrap.auto: false`
+  #      （grep 单行解析、bash 3.2 兼容、文件缺失即视为未设；容忍前导空白 /
+  #      键冒号前空白 / 行尾注释）→ disabled。
+  #   矛盾输入 env=1 + config=false → disabled（显式持久关 > 冗余 env=1 · 向关信号倒）。
+  # ⚠ 等价锚定（同构规则单一真相指认 · 承 R4-02）：本函数与
+  #   session_start_bootstrap_hint.sh 的 switch_on 块实现**同一条 2 子句规则、逐字同构**
+  #   （同一组关值 {0,false} 大小写不敏感 + 同一 config false 正则 + 同一子句求值顺序）
+  #   ——「一侧拉起、另一侧拒绝接力」的半开态按构造不存在（AC-6）。两文件无法共享
+  #   函数，任一侧改动本规则时必须逐字同步另一侧。
+  local _env_val
+  _env_val="$(printf '%s' "${HARNESS_AUTO_BOOTSTRAP:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$_env_val" in
+    0|false) return 1 ;;
+  esac
+  if [ -f "$TOP/HARNESS_CONFIG.yaml" ] \
+     && grep -E -q '^[[:space:]]*bootstrap\.auto[[:space:]]*:[[:space:]]*false[[:space:]]*(#.*)?$' \
+          "$TOP/HARNESS_CONFIG.yaml" 2>/dev/null; then
+    return 1
+  fi
+  return 0
 }
 
 _maybe_auto_bootstrap() {
-  # $1 = 触发场景（first-run / retry），仅用于日志。
-  # 判据：开关开 + .bootstrap_done 缺失（B-3 重试判据 · done 仅 T1 exit 0 落）
+  # $1 = 触发场景（first-run / retry）· 语义载荷（M-2c · ADR-015，非仅日志）：
+  #   first-run → 确定发起时落 $STATE_DIR/.bootstrap_attempted 持久标记，不查门；
+  #   retry     → 查 .bootstrap_attempted 前置门（缺失 = 存量 pre-upgrade 项目，
+  #               不发起 · AC-5a 零追溯），不落标记。
+  # 判据：谓词 enabled（opt-out 默认开）+ .bootstrap_done 缺失（done 仅 T1 exit 0 落）
+  #       + [仅 retry] .bootstrap_attempted 存在（M-2c 前置门）
   #       + .bootstrap_running 缺失或其 pid 已死（后台真在跑才不重复拉起 · R4-01）。
   _auto_bootstrap_enabled || return 0
   [ -f "$STATE_DIR/.bootstrap_done" ] && return 0
+  if [ "$1" = "retry" ] && [ ! -f "$STATE_DIR/.bootstrap_attempted" ]; then
+    log_info "auto-bootstrap（retry）：未检测到 .bootstrap_attempted（存量项目零追溯 · ADR-015），跳过 auto-bootstrap"
+    return 0
+  fi
   if [ -f "$STATE_DIR/.bootstrap_running" ]; then
     # R4-01 死锁自愈：哨兵唯一清理点是 T1 finish()，脚本无 trap——后台子进程被
     # SIGKILL/机器重启/杀进程组时哨兵永久残留；仅按存在性判断会把 B 路径重试判据
@@ -198,12 +218,21 @@ _maybe_auto_bootstrap() {
     return 0
   fi
 
+  # M-2c：first-run 确定要发起时（已定位到脚本、调用之前）落 .bootstrap_attempted
+  # 持久标记（独立于成败、永不自动清理 · retry 前置门的唯一证据）。落标记失败不阻断、
+  # 照常发起——标记是零回归门证据而非功能前提（2>/dev/null 吞错）；retry 路径不落
+  # 标记（「曾在 first-run 发起过」语义纯净）。
+  if [ "$1" = "first-run" ]; then
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    touch "$STATE_DIR/.bootstrap_attempted" 2>/dev/null
+  fi
+
   # B-4/F-3 后台化：--background 内部 nohup 自后台化（重活全在子进程），父进程秒退
   # 不占 SessionStart 60s 预算；日志落 $STATE_DIR/bootstrap.log，结果由
   # .bootstrap_done/.bootstrap_failed 哨兵承载，下会话 hint hook（T4）接力。
-  # --yes = opt-in 开关即用户显式授权（B-2）。吞掉脚本非零码（T1 退出码是诊断
-  # 信号非 hook 语义），本 hook 恒 exit 0（AC-4）；stdout 并入 stderr 保持 hook stdout 干净。
-  log_info "auto-bootstrap（$1）：开关已开，后台启动 bootstrap（日志：$STATE_DIR/bootstrap.log）"
+  # --yes = 首会话默认授权（opt-out 逃生阀关闭前 · ADR-015）。吞掉脚本非零码（T1 退出码
+  # 是诊断信号非 hook 语义），本 hook 恒 exit 0（AC-4）；stdout 并入 stderr 保持 hook stdout 干净。
+  log_info "auto-bootstrap（$1）：默认开（ADR-015），后台启动 bootstrap（日志：$STATE_DIR/bootstrap.log）"
   if ! bash "$bootstrap_sh" --yes --background >&2; then
     log_warn "auto-bootstrap（$1）：后台启动失败（非阻断），下会话将重试；可手动运行 /harness-core:bootstrap"
   fi
@@ -346,8 +375,9 @@ _scaffold_new_project() {
     log_warn "脚手架安装部分完成（有警告），请检查上方日志；本次不落哨兵，将于下会话重试"
   fi
 
-  # T3 · opt-in auto-bootstrap（spec B-2 · F-6 挂函数体尾部，天然覆盖两个调用点）：
-  # 开关开 → 后台执行 bootstrap；成败均不影响上方 .scaffold_initialized 落盘语义（B-3 · AC-4）
+  # auto-bootstrap first-run（opt-out 默认开 · ADR-015；F-6 挂函数体尾部）：
+  # 谓词默认 enabled（逃生阀显式关闭才退出）→ 落 .bootstrap_attempted 后后台执行
+  # bootstrap；成败均不影响上方 .scaffold_initialized 落盘语义（B-3 · AC-4）
   _maybe_auto_bootstrap "first-run"
 }
 
@@ -454,8 +484,9 @@ _drift_sync() {
     log_info "drift-sync 完成：刷新 ${refreshed} · 复活 ${revived} · 定制跳过 ${skipped}（权威源=plugin 缓存 · 单向）"
   fi
 
-  # T3 · auto-bootstrap 失败重试（spec B-3 · F-6 挂函数体尾部，覆盖两个调用点）：
-  # 开关开 + .bootstrap_done 缺失 + .bootstrap_running 缺失或 pid 已死（R4-01）
+  # auto-bootstrap 失败重试（opt-out 默认开 · ADR-015；F-6 挂函数体尾部）：
+  # 谓词 enabled + .bootstrap_done 缺失 + .bootstrap_attempted 存在（M-2c 前置门 ·
+  # 存量 pre-upgrade 项目零追溯 AC-5a）+ .bootstrap_running 缺失或 pid 已死（R4-01）
   # → 重跑（判据在 _maybe_auto_bootstrap 内）
   _maybe_auto_bootstrap "retry"
   return 0
