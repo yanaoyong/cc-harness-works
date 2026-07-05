@@ -501,6 +501,38 @@ EOF
   fi
 fi
 
+# 5a-bis. wiki-background 集合根骨架落盘（与 5a wiki/ 对称 · best-effort 非门禁）
+#   幂等判据 = wiki-background/README.md 存在即跳过（与 5a wiki state 解耦，独立顶层块，
+#   不嵌 5a 的 else 分支 · INFO-2）。旁路定性（ADR-005 + WK-B2 缺位降级）：任何路径都
+#   不置 DEGRADED、不入 FINAL_READY、不阻断 bootstrap（AC-3）。只 ever 创建 README.md，
+#   从不触碰 wiki-background/ 下其它文件（保护用户既有语料 · AC-2/INFO-1）。
+#   不 wiki-rescan --init：wiki-background/ 是 corpus 集合根、非单个 wiki（wiki 是其
+#   <corpus>/ 子目录，各自持 _meta/state.json），根级无 state.json 语义。
+mkdir -p "$TOP/wiki-background" 2>/dev/null
+if [ ! -f "$TOP/wiki-background/README.md" ]; then
+  cat > "$TOP/wiki-background/README.md" <<'EOF'
+# 背景知识 wiki 集合根 · wiki-background/
+
+> 本目录由 harness bootstrap 落盘（只落骨架、0 实际语料）。
+
+## corpus 布局
+
+`wiki-background/<corpus>/` 每个子目录 = 一个独立背景 corpus，结构同构于项目文档
+wiki `wiki/`（`index.md` + 互链 markdown 页面 + `_meta/`）。组件按
+`--wiki wiki-background/<corpus>/` 单 corpus 语义消费（路径为仓库根相对路径）。
+
+## 消费纪律
+
+corpus-aware 路由 / 缺位优雅降级 / 批判性平衡吸收，权威源见
+`文档wiki查询与摄取规范.md` §5 WK-B（本占位单向引用，不复制正文）。
+
+## 集成深度
+
+旁路查询工具产物根（ADR-005）——不进任一阶段门禁、缺位不阻塞主流程。
+EOF
+  log_info "✅ wiki-background/README.md 占位已落盘（背景 corpus 集合根 · 旁路）"
+fi
+
 # 5b. skill 注册（本身幂等：ln -sfn / SKILL.md 覆写 → 骨架已存在也照常刷新注册，
 #     修复「wiki 已在而 skill 未注册」缝隙；F-7 的整步跳过语义仅约束 5a 防 rescan exit 2）。
 #     F-2 硬约束：注册注入的路径一律经 .harness/components/ 持久副本产生——
