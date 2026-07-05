@@ -141,6 +141,75 @@ _write_mirror_baseline() {
   return 0
 }
 
+# ------------------------------------------------------------
+# opt-in auto-bootstrap（T3 · spec B-1/B-2/B-3/B-4 · F-3/F-6 闭合）
+# 未设任一开关 → 本节全部函数零输出零副作用（AC-3 零回归）；
+# 任何失败仅 log_warn 且恒 return 0（fail-open · AC-4），
+# 且不影响 .scaffold_initialized 落盘语义（B-3 哨兵独立）。
+# ------------------------------------------------------------
+
+_auto_bootstrap_enabled() {
+  # 开关（B-1 · 两者取或）：
+  #   ① 环境变量 HARNESS_AUTO_BOOTSTRAP=1（首会话唯一可行形态）
+  #   ② HARNESS_CONFIG.yaml 单行键 `bootstrap.auto: true`（次会话起持久形态 · OQ-4 决议：
+  #      grep 单行解析、bash 3.2 兼容、文件缺失即视为关；容忍前导空白与行尾注释）
+  # ⚠ 等价锚定（对称指认 · R4-02）：下方 grep 正则须与 session_start_bootstrap_hint.sh
+  #   opt-in 开关解析段（约 L138-144）的正则**完全一致**。两文件无法共享函数，以注释
+  #   互相指认——任一侧改动开关解析时必须同步另一侧，否则出现「T3 自动拉起、T4 拒绝
+  #   接力」的开关半开态（t6_test_run_v1 缺陷 #2）。
+  [ "${HARNESS_AUTO_BOOTSTRAP:-}" = "1" ] && return 0
+  [ -f "$TOP/HARNESS_CONFIG.yaml" ] || return 1
+  grep -E -q '^[[:space:]]*bootstrap\.auto[[:space:]]*:[[:space:]]*true[[:space:]]*(#.*)?$' \
+    "$TOP/HARNESS_CONFIG.yaml" 2>/dev/null
+}
+
+_maybe_auto_bootstrap() {
+  # $1 = 触发场景（first-run / retry），仅用于日志。
+  # 判据：开关开 + .bootstrap_done 缺失（B-3 重试判据 · done 仅 T1 exit 0 落）
+  #       + .bootstrap_running 缺失或其 pid 已死（后台真在跑才不重复拉起 · R4-01）。
+  _auto_bootstrap_enabled || return 0
+  [ -f "$STATE_DIR/.bootstrap_done" ] && return 0
+  if [ -f "$STATE_DIR/.bootstrap_running" ]; then
+    # R4-01 死锁自愈：哨兵唯一清理点是 T1 finish()，脚本无 trap——后台子进程被
+    # SIGKILL/机器重启/杀进程组时哨兵永久残留；仅按存在性判断会把 B 路径重试判据
+    # 永久短路。故与 hint hook（session_start_bootstrap_hint.sh 分支 A · kill -0）
+    # 同口径判 pid 存活：读哨兵首行 pid，存活 → 不重复拉起；已死/为空 → 清除残留
+    # 哨兵并视作未在运行，照常走拉起路径（--background 会重写哨兵，自愈闭环）。
+    local _bs_pid
+    _bs_pid="$(head -1 "$STATE_DIR/.bootstrap_running" 2>/dev/null | tr -d '[:space:]')"
+    if [ -n "$_bs_pid" ] && kill -0 "$_bs_pid" 2>/dev/null; then
+      log_info "auto-bootstrap（$1）：后台任务仍在执行（pid=$_bs_pid · $STATE_DIR/.bootstrap_running），本会话不重复拉起"
+      return 0
+    fi
+    rm -f "$STATE_DIR/.bootstrap_running" 2>/dev/null
+    log_info "auto-bootstrap（$1）：检测到残留 .bootstrap_running（pid=${_bs_pid:-空} 已死），已清除残留哨兵，按未运行继续"
+  fi
+
+  # 定位 T1 脚本（既有回退链风格）：CLAUDE_PLUGIN_ROOT/hooks（消费方安装态）
+  # → $TOP/plugins/harness-core/hooks（本仓开发态）→ 全不命中 warning 跳过不阻断
+  local bootstrap_sh=""
+  if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/hooks/harness_bootstrap.sh" ]; then
+    bootstrap_sh="${CLAUDE_PLUGIN_ROOT}/hooks/harness_bootstrap.sh"
+  elif [ -f "$TOP/plugins/harness-core/hooks/harness_bootstrap.sh" ]; then
+    bootstrap_sh="$TOP/plugins/harness-core/hooks/harness_bootstrap.sh"
+  fi
+  if [ -z "$bootstrap_sh" ]; then
+    log_warn "auto-bootstrap（$1）：未找到 harness_bootstrap.sh（CLAUDE_PLUGIN_ROOT/hooks 与 plugins/harness-core/hooks 均无），跳过；可手动运行 /harness-core:bootstrap"
+    return 0
+  fi
+
+  # B-4/F-3 后台化：--background 内部 nohup 自后台化（重活全在子进程），父进程秒退
+  # 不占 SessionStart 60s 预算；日志落 $STATE_DIR/bootstrap.log，结果由
+  # .bootstrap_done/.bootstrap_failed 哨兵承载，下会话 hint hook（T4）接力。
+  # --yes = opt-in 开关即用户显式授权（B-2）。吞掉脚本非零码（T1 退出码是诊断
+  # 信号非 hook 语义），本 hook 恒 exit 0（AC-4）；stdout 并入 stderr 保持 hook stdout 干净。
+  log_info "auto-bootstrap（$1）：开关已开，后台启动 bootstrap（日志：$STATE_DIR/bootstrap.log）"
+  if ! bash "$bootstrap_sh" --yes --background >&2; then
+    log_warn "auto-bootstrap（$1）：后台启动失败（非阻断），下会话将重试；可手动运行 /harness-core:bootstrap"
+  fi
+  return 0
+}
+
 # ============================================================
 # 函数：新项目脚手架安装（须在主流程前定义）
 # ============================================================
@@ -276,6 +345,10 @@ _scaffold_new_project() {
   else
     log_warn "脚手架安装部分完成（有警告），请检查上方日志；本次不落哨兵，将于下会话重试"
   fi
+
+  # T3 · opt-in auto-bootstrap（spec B-2 · F-6 挂函数体尾部，天然覆盖两个调用点）：
+  # 开关开 → 后台执行 bootstrap；成败均不影响上方 .scaffold_initialized 落盘语义（B-3 · AC-4）
+  _maybe_auto_bootstrap "first-run"
 }
 
 # ============================================================
@@ -380,6 +453,11 @@ _drift_sync() {
   if [ "$refreshed" -gt 0 ] || [ "$revived" -gt 0 ] || [ "$skipped" -gt 0 ]; then
     log_info "drift-sync 完成：刷新 ${refreshed} · 复活 ${revived} · 定制跳过 ${skipped}（权威源=plugin 缓存 · 单向）"
   fi
+
+  # T3 · auto-bootstrap 失败重试（spec B-3 · F-6 挂函数体尾部，覆盖两个调用点）：
+  # 开关开 + .bootstrap_done 缺失 + .bootstrap_running 缺失或 pid 已死（R4-01）
+  # → 重跑（判据在 _maybe_auto_bootstrap 内）
+  _maybe_auto_bootstrap "retry"
   return 0
 }
 
