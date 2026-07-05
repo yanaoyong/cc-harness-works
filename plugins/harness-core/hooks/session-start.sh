@@ -84,12 +84,15 @@ _file_checksum() {
 
 _mirror_pairs() {
   # 镜像件同步映射：<plugin 侧源>|<项目侧落点>|<基线 key 前缀>
-  # 四类镜像（skills/agents/rules/commands → .harness/）+ workflows 同步件（双落盘）
+  # 五类镜像（skills/agents/rules/commands/scripts → .harness/）+ workflows 同步件（双落盘）
+  # scripts 镜像对（feat-plugin-display-parity）：statusline/list_flows + lib 三件 → .harness/scripts/；
+  # 项目特定脚本（sync_public_marketplace.sh 等）不在 plugin 源内，drift-sync 天然不触碰
   printf '%s\n' \
     "$PLUGIN_SKILLS|$SKILLS_DIR|skills" \
     "$PLUGIN_AGENTS|$AGENTS_DIR|agents" \
     "$PLUGIN_RULES|$RULES_DIR|rules" \
     "$PLUGIN_ROOT/commands|$HARNESS_DIR/commands|commands" \
+    "$PLUGIN_ROOT/scripts|$HARNESS_DIR/scripts|scripts" \
     "$PLUGIN_ROOT/workflows|$HARNESS_DIR/workflows|workflows" \
     "$PLUGIN_ROOT/workflows|$TOP/.claude/workflows|workflows@claude"
 }
@@ -215,6 +218,17 @@ _scaffold_new_project() {
       log_info "✅ commands 已安装到 $HARNESS_DIR/commands/"
     else
       log_warn "commands 安装失败"
+      had_error=1
+    fi
+  fi
+
+  # 6b. 复制 scripts 到 .harness/scripts/（statusline/list_flows + lib · 与 _mirror_pairs 第 7 组同口径 · feat-plugin-display-parity）
+  if [ -d "$PLUGIN_ROOT/scripts" ]; then
+    mkdir -p "$HARNESS_DIR/scripts"
+    if cp -rn "$PLUGIN_ROOT/scripts/." "$HARNESS_DIR/scripts/" 2>/dev/null; then
+      log_info "✅ scripts 已安装到 $HARNESS_DIR/scripts/"
+    else
+      log_warn "scripts 安装失败"
       had_error=1
     fi
   fi

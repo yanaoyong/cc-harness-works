@@ -1,5 +1,5 @@
 {
-  "_note": "RM-141 落地 + feat-plugin-hooks-commands-migration-20260701 补齐 + fix-resident-contract-hook-consistency-20260702 修订：SessionStart(5) + PreToolUse(2: Bash+Skill) + PostToolUse(1: Edit|Write|MultiEdit) + Stop(1) 共 9 个钩子。仅 manifest 注册，plugin 安装态生效；本仓运行时引用仍以 .claude/settings.json 为准。SessionStart 顺序假设按单 group 内层 hooks 数组序执行（D-7 finding 基此假设）：session-start（脚手架落盘）先行、session_start_resident_contract（契约注入）在后，与注入源三级回退链构成首会话双保险。三维护 hook（autosync/autoflip/wiki_freshness）注册取舍：autosync 无额外资产依赖、注册即生效；autoflip 依赖 $TOP/.harness/scripts/lib/merged_detect.sh——纯 plugin 安装态该资产未随脚手架落盘时 fail-open no-op（守卫静默 exit 0 永不阻断），注册使其就绪待命而非即时生效，依赖资产补齐属后续卡（R-6）；wiki_freshness 已由 fix-wiki-freshness-hook-20260702 改为 wiki-rescan bin 三级回退链定位（$TOP/.harness/ 消费方安装态 → $TOP/plugins/harness-core/ 本仓开发态 → $CLAUDE_PLUGIN_ROOT/ plugin 包内直读 · 首个可读即用），本仓开发态即时生效；三级全不命中仍 fail-open 静默 exit 0 永不阻断。本 hooks.json 与本仓 .claude/settings.json 两注册点顺序独立、各自成立（plugin 安装态需脚手架先行；本仓开发态注入源回退链②恒可用故顺序无关），顺序不同为有意设计而非漂移。PostToolUse 使用 stop_progress_check.sh（非 post_edit_checks.sh——项目特定，不入 plugin）。",
+  "_note": "RM-141 落地 + feat-plugin-hooks-commands-migration-20260701 补齐 + fix-resident-contract-hook-consistency-20260702 修订：SessionStart(6) + PreToolUse(2: Bash+Skill) + PostToolUse(1: Edit|Write|MultiEdit) + Stop(1) + UserPromptSubmit(1) 共 11 个钩子。仅 manifest 注册，plugin 安装态生效；本仓运行时引用仍以 .claude/settings.json 为准。SessionStart 顺序假设按单 group 内层 hooks 数组序执行（D-7 finding 基此假设）：session-start（脚手架落盘）先行、session_start_resident_contract（契约注入）在后，与注入源三级回退链构成首会话双保险。三维护 hook（autosync/autoflip/wiki_freshness）注册取舍：autosync 无额外资产依赖、注册即生效；autoflip 依赖 $TOP/.harness/scripts/lib/merged_detect.sh——纯 plugin 安装态该资产未随脚手架落盘时 fail-open no-op（守卫静默 exit 0 永不阻断），注册使其就绪待命而非即时生效，依赖资产补齐属后续卡（R-6）；wiki_freshness 已由 fix-wiki-freshness-hook-20260702 改为 wiki-rescan bin 三级回退链定位（$TOP/.harness/ 消费方安装态 → $TOP/plugins/harness-core/ 本仓开发态 → $CLAUDE_PLUGIN_ROOT/ plugin 包内直读 · 首个可读即用），本仓开发态即时生效；三级全不命中仍 fail-open 静默 exit 0 永不阻断。本 hooks.json 与本仓 .claude/settings.json 两注册点顺序独立、各自成立（plugin 安装态需脚手架先行；本仓开发态注入源回退链②恒可用故顺序无关），顺序不同为有意设计而非漂移。PostToolUse 使用 stop_progress_check.sh（非 post_edit_checks.sh——项目特定，不入 plugin）。feat-plugin-display-parity-20260704 增补：新增 UserPromptSubmit(1: user_prompt_state_inject.sh——已三级回退链改造 + G-1 双注入守卫，撤销旧'prompt_state 项目特定不入 plugin'判断，plugin 安装态可生效) + SessionStart 第 6 项 setup_statusline.sh（须列末位：依赖 session-start.sh 先把 statusline.sh 落盘 $TOP/.harness/scripts/；首会话时序 scaffold 先行，未落盘时 setup 守卫④检测两文件缺失即让位、下会话补齐）；共 11 个钩子。R4 副作用留痕：本卡随 scripts/ 镜像落盘 lib/merged_detect.sh，使已注册的 session_start_autoflip 在纯 plugin 安装态由 no-op 变就绪生效（原 R-6 依赖资产补齐即本卡完成）。",
   "hooks": {
     "SessionStart": [
       {
@@ -23,11 +23,24 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start_wiki_freshness.sh\""
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/setup_statusline.sh\""
           }
         ]
       }
     ],
-    "UserPromptSubmit": [],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/user_prompt_state_inject.sh\""
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash",
