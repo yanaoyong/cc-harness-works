@@ -107,7 +107,7 @@ CODEGRAPH_INSTALL_URL="${HARNESS_CODEGRAPH_INSTALL_URL:-https://raw.githubuserco
 #   把 64 位十六进制结果替换下行占位值（并一并核对下方 _known_candidates 落盘位置清单
 #   是否仍与上游 install.sh 行为一致）。运行时可用 HARNESS_BOOTSTRAP_SHA256 覆盖（优先）。
 #   占位值/非法值（非 64hex）→ fail-closed 拒装（AC-8），绝不放行未校验的远程脚本。
-BUILTIN_INSTALL_SHA256="f4e90c6e0c1d2ac95a43fa6e82e4caf76fabdb18310afc72597314b58632e56c"  # v0.6.0 发版复核 · 2026-07-05 与上游实测一致（curl+sha256sum 复跑）
+BUILTIN_INSTALL_SHA256="f4e90c6e0c1d2ac95a43fa6e82e4caf76fabdb18310afc72597314b58632e56c"  # v0.7.0 发版复核 · 2026-07-05 与上游实测一致（curl+sha256sum 复跑）
 
 # ============================================================
 # 工具函数
