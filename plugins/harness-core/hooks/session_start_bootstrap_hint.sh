@@ -11,8 +11,9 @@
 # == detect-only 红线与唯一例外写入分支（F-3 接力）==
 # 本 hook 默认 detect-only：零写入、零出站（cg doctor / 目录检测均为本地只读）。
 # **唯一例外** = B 路径接力分支：后台 bootstrap（T3 nohup）已把引擎装好而索引未建、且
-# opt-in 开关开（HARNESS_AUTO_BOOTSTRAP=1 ∨ config `bootstrap.auto: true` grep 单行解析
-# · OQ-4 决议）→ 本 hook 接力 `cg init`（可写入 .codegraph/ 索引；失败吞掉 warning 一行）。
+# 开关判定为开（opt-out 默认开 · ADR-015：仅 env HARNESS_AUTO_BOOTSTRAP ∈ {0,false} 或
+# config `bootstrap.auto: false` 显式关）→ 本 hook 接力 `cg init`（可写入 .codegraph/
+# 索引；失败吞掉 warning 一行）。
 # 其余任何路径不写任何文件（含不清理残留哨兵）。
 #
 # 后台哨兵消费（T1 契约 · t1_notes §1.3，均在 $STATE_DIR）：
@@ -129,22 +130,33 @@ if [ -f "$STATE_DIR/.bootstrap_running" ]; then
   # pid 已死的残留哨兵：视作未在运行，落入后续分支（detect-only 不代为清理哨兵）
 fi
 
-# opt-in 开关（与 T3 挂载同一语义：环境变量 ∨ config 单行键，取或 · OQ-4 决议）
-# ⚠ 等价锚定：下方 grep 正则须与 session-start.sh `_auto_bootstrap_enabled`（约 L155）
-#   的正则**完全一致**（容忍前导空白 / 键冒号前空白 / 行尾注释）。两文件无法共享函数，
-#   以本注释互相指认——任一侧改动开关解析时必须同步另一侧，否则会出现
-#   「T3 自动拉起、T4 拒绝接力」的开关半开态（t6_test_run_v1 缺陷 #2）。
-switch_on=0
-if [ "${HARNESS_AUTO_BOOTSTRAP:-0}" = "1" ]; then
-  switch_on=1
-elif [ -f "$TOP/HARNESS_CONFIG.yaml" ] \
-     && grep -E -q '^[[:space:]]*bootstrap\.auto[[:space:]]*:[[:space:]]*true[[:space:]]*(#.*)?$' \
-          "$TOP/HARNESS_CONFIG.yaml" 2>/dev/null; then
-  switch_on=1
+# opt-out 开关（2 子句规则 · M-1a · ADR-015 · 关信号命中即关，否则默认开）：
+#   ① env HARNESS_AUTO_BOOTSTRAP ∈ {0,false}（大小写不敏感）→ 关；
+#   ② env 非上述关值时，HARNESS_CONFIG.yaml 含单行键 `bootstrap.auto: false`
+#      （grep 单行解析、bash 3.2 兼容、文件缺失即视为未设；容忍前导空白 /
+#      键冒号前空白 / 行尾注释）→ 关。
+#   矛盾输入 env=1 + config=false → 关（显式持久关 > 冗余 env=1 · 向关信号倒）。
+# ⚠ 等价锚定（同构规则单一真相指认 · 承 R4-02）：本块与 session-start.sh
+#   `_auto_bootstrap_enabled` 实现**同一条 2 子句规则、逐字同构**（同一组关值
+#   {0,false} 大小写不敏感 + 同一 config false 正则 + 同一子句求值顺序）——
+#   「一侧拉起、另一侧拒绝接力」的半开态按构造不存在（AC-6）。两文件无法共享
+#   函数，任一侧改动本规则时必须逐字同步另一侧。
+switch_on=1
+_env_val="$(printf '%s' "${HARNESS_AUTO_BOOTSTRAP:-}" | tr '[:upper:]' '[:lower:]')"
+case "$_env_val" in
+  0|false) switch_on=0 ;;
+esac
+if [ "$switch_on" = 1 ] && [ -f "$TOP/HARNESS_CONFIG.yaml" ] \
+   && grep -E -q '^[[:space:]]*bootstrap\.auto[[:space:]]*:[[:space:]]*false[[:space:]]*(#.*)?$' \
+        "$TOP/HARNESS_CONFIG.yaml" 2>/dev/null; then
+  switch_on=0
 fi
 
 # 分支 B：接力 cg init（唯一例外写入分支 · F-3 闭合）
 # 触发条件 = 引擎已就绪（探测通过）且 .codegraph/ 缺失 且 开关开
+# 默认开语义下对「引擎已就绪、索引缺失」存量项目的本地 cg init 追溯 = AC-5d 显式
+# 接受（本地 / 幂等 / 无联网 / 无供应链面 · carve-out · ADR-015）；分支 B 代码逻辑
+# 零改动、不加证据门（不引入跨 hook 读 .bootstrap_attempted 的耦合）。
 if [ "$engine_ok" = 1 ] && [ "$index_ok" = 0 ] && [ "$switch_on" = 1 ]; then
   if CG_PROJECT="$TOP" sh "$CG" init >/dev/null 2>&1; then
     index_ok=1

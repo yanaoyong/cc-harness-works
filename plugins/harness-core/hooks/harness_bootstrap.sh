@@ -15,7 +15,7 @@
 #   ⑥ 就绪报告（stdout）+ 哨兵
 #
 # 旗标：
-#   --yes          非交互（B 路径 opt-in 开关即显式授权；A 路径 command 向用户确认后传入）
+#   --yes          非交互（B 路径首会话默认授权〔opt-out 逃生阀关闭前 · ADR-015〕；A 路径 command 向用户确认后传入）
 #   --report-only  只探测三项就绪态（engine/index/wiki）并输出，零写入；
 #                  输出固定三行 key=value（engine=ready|missing / index=… / wiki=…），
 #                  全就绪 exit 0、有缺项 exit 20（供 T4 hint hook 机读；优先级高于其他旗标）
@@ -52,7 +52,7 @@ log_warn() { echo "$PREFIX ⚠️  $*" >&2; }
 usage() {
   cat >&2 <<'USAGE'
 用法：harness_bootstrap.sh [--yes] [--report-only] [--background]
-  --yes          非交互模式（跳过引擎安装确认；opt-in 开关/用户确认即显式授权）
+  --yes          非交互模式（跳过引擎安装确认；B 路径首会话默认授权〔opt-out · ADR-015〕/ A 路径用户确认后传入）
   --report-only  只探测 engine/index/wiki 三项就绪态并输出，零写入（全就绪 0 / 有缺项 20）
   --background   nohup 自后台化，本进程秒退（日志 $STATE_DIR/bootstrap.log）
 退出码：0 全就绪 / 20 部分完成(降级) / 21 校验失败或缺失拒装 / 22 无网络或下载失败 / 2 用法或环境错误
@@ -106,7 +106,7 @@ CODEGRAPH_INSTALL_URL="${HARNESS_CODEGRAPH_INSTALL_URL:-https://raw.githubuserco
 #   把 64 位十六进制结果替换下行占位值（并一并核对下方 _known_candidates 落盘位置清单
 #   是否仍与上游 install.sh 行为一致）。运行时可用 HARNESS_BOOTSTRAP_SHA256 覆盖（优先）。
 #   占位值/非法值（非 64hex）→ fail-closed 拒装（AC-8），绝不放行未校验的远程脚本。
-BUILTIN_INSTALL_SHA256="f4e90c6e0c1d2ac95a43fa6e82e4caf76fabdb18310afc72597314b58632e56c"  # v0.5.1 发版刷新 · 2026-07-05 真机验证通过
+BUILTIN_INSTALL_SHA256="f4e90c6e0c1d2ac95a43fa6e82e4caf76fabdb18310afc72597314b58632e56c"  # v0.6.0 发版复核 · 2026-07-05 与上游实测一致（curl+sha256sum 复跑）
 
 # ============================================================
 # 工具函数
