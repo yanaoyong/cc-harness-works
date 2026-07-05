@@ -1,6 +1,6 @@
 {
   "name": "harness-profile-react-vite",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Harness React+Vite+TypeScript FE 栈 profile（首个 FE profile · 全栈对等）：FE 编码·评审·测试 skill 套件 + 栈绑定层（vitest 等价测试命令 + 输出解析器 + FE ≈8 分层 Spec 映射）。反向单向依赖 harness-core。RM-141 落地：FE skill 文件已物理迁移进本 plugin 目录。",
   "author": {
     "name": "myharness"
@@ -18,7 +18,7 @@
   "dependencies": [
     {
       "name": "harness-core",
-      "version": "~0.6.0"
+      "version": "~0.6.1"
     }
   ],
   "requiredCommands": ["npx"]

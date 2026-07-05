@@ -20,7 +20,8 @@
 #                  输出固定三行 key=value（engine=ready|missing / index=… / wiki=…），
 #                  全就绪 exit 0、有缺项 exit 20（供 T4 hint hook 机读；优先级高于其他旗标）
 #   --background   自后台化（nohup 重跑自身 --yes），本进程秒退 exit 0（F-3 · B 路径支撑）；
-#                  日志：$STATE_DIR/bootstrap.log（每次后台运行覆写 = 最近一次结果语义）
+#                  日志：$STATE_DIR/bootstrap.log（每次后台运行覆写 = 最近一次结果语义；
+#                  STATE_DIR=${HARNESS_STATE_DIR:-$TOP/.harness/state} · 项目本地 · ADR-016）
 #
 # 退出码（可控枚举 · 恒不崩溃态；hook 调用侧〔T3/T4〕负责吞非零码保证恒 exit 0）：
 #   0   全就绪（engine+index+wiki state 齐 · 无降级项）
@@ -29,7 +30,7 @@
 #   22  无网络 / 无 curl / 下载失败或超时
 #   2   用法错误 / 无法定位仓库根
 #
-# 哨兵（独立于 .scaffold_initialized · B-3）：均落 $STATE_DIR（${CLAUDE_PLUGIN_DATA:-$TOP/.harness/state}）
+# 哨兵（独立于 .scaffold_initialized · B-3）：均落 $STATE_DIR（${HARNESS_STATE_DIR:-$TOP/.harness/state} · 项目本地 · ADR-016）
 #   .bootstrap_running  后台执行中（--background 父进程落盘，内容=子进程 pid；run 结束移除）
 #   .bootstrap_done     最近一次执行全就绪（仅 exit 0 时落；失败则移除 → 下会话重试判据）
 #   .bootstrap_failed   最近一次执行失败（内容 exit_code=/reason=/time= · 供 T4 接力诊断）
@@ -88,7 +89,7 @@ if [ -z "$TOP" ]; then
 fi
 cd "$TOP" || exit 2
 
-STATE_DIR="${CLAUDE_PLUGIN_DATA:-$TOP/.harness/state}"
+STATE_DIR="${HARNESS_STATE_DIR:-$TOP/.harness/state}"
 LOG_FILE="$STATE_DIR/bootstrap.log"
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -221,6 +222,8 @@ fi
 
 if [ "$BACKGROUND" -eq 1 ] && [ "${HARNESS_BOOTSTRAP_BG:-0}" != "1" ]; then
   mkdir -p "$STATE_DIR" 2>/dev/null
+  # 自忽略：STATE_DIR 现项目本地（ADR-016），幂等写 `*` 防运行时哨兵/日志被 commit
+  [ -f "$STATE_DIR/.gitignore" ] || printf '*\n' > "$STATE_DIR/.gitignore" 2>/dev/null
   {
     echo "== harness bootstrap 后台运行 · $(date -u +%Y-%m-%dT%H:%M:%SZ) =="
   } > "$LOG_FILE" 2>/dev/null
@@ -247,6 +250,7 @@ fi
 finish() {
   local code="$1" reason
   mkdir -p "$STATE_DIR" 2>/dev/null
+  [ -f "$STATE_DIR/.gitignore" ] || printf '*\n' > "$STATE_DIR/.gitignore" 2>/dev/null  # 自忽略（ADR-016）
   rm -f "$STATE_DIR/.bootstrap_running" 2>/dev/null
   if [ "$code" -eq 0 ]; then
     touch "$STATE_DIR/.bootstrap_done" 2>/dev/null

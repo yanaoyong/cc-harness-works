@@ -21,7 +21,10 @@
 #                       视作未在运行，落入后续分支；detect-only 不代为清理）。
 #   .bootstrap_failed ：最近一次失败（三行 exit_code=/reason=/time=）→ 读 reason 提示一行。
 #   bootstrap.log     ：仅在提示行里给路径供用户跟进，本 hook 不读不写其内容。
-# STATE_DIR 取法与 session-start.sh / harness_bootstrap.sh 完全一致。
+# STATE_DIR 取法与 session-start.sh / harness_bootstrap.sh 完全一致（三处逐字同构 · AC-1）：
+#   STATE_DIR="${HARNESS_STATE_DIR:-$TOP/.harness/state}" · 项目本地，不再取 CLAUDE_PLUGIN_DATA
+#   （宿主按插件全局会致跨项目哨兵泄漏 · 本卡 ADR-016 修复）。漏改此处 → 落点分裂、跨 hook
+#   读 .bootstrap_running/.bootstrap_failed 断裂。
 #
 # 守卫短路（对齐 session_start_wiki_freshness.sh detect-only 先例）：
 #   ①仓库根定位 → ②bin/cg 三级回退链定位（.harness/ 消费方安装态 → plugins/harness-core/
@@ -54,7 +57,7 @@ elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -r "${CLAUDE_PLUGIN_ROOT}/components/
 fi
 [ -z "$CG" ] && exit 0
 
-STATE_DIR="${CLAUDE_PLUGIN_DATA:-$TOP/.harness/state}"
+STATE_DIR="${HARNESS_STATE_DIR:-$TOP/.harness/state}"
 
 # 已知落盘位置 PATH 注入（F-5 同款候选清单 · 仅注入本进程 · 纯探测零写入）：
 # 上游 install.sh 把 PATH 写 shell rc，hook 进程不生效——后台 bootstrap 装好的引擎若不在
