@@ -71,6 +71,20 @@ export HARNESS_AUTO_BOOTSTRAP=0        # 环境变量逃生阀
 
 从旧版（哨兵落全局）升级的项目，因哨兵落点改为项目本地，**首次会话可能重跑一次 bootstrap**。这是一次性迁移副作用，幂等无害（已装好的引擎 / 索引 / wiki 骨架各步骤会自动跳过）。
 
+## 随项目分发插件声明 · /harness-core:pin-to-project
+
+装好插件后，如果你是项目主人、希望**队友克隆仓库即被提示装好同一套插件**（免去每人手工 `/plugin marketplace add` + `/plugin install`），可主动运行：
+
+```
+/harness-core:pin-to-project
+```
+
+它会把 marketplace（`cc-harness-works`）+ 本项目**已启用插件**的声明 JSON-safe 合并写进 tracked 的 `.claude/settings.json`（保留 `statusLine` 等既有键）。提交入库后，队友克隆并信任仓库时，Claude Code 会提示安装这些插件。
+
+- **opt-in 语义**：仅在你**主动运行**本命令时才写，绝不自动触发、不注册任何 hook。写完记得 `git add .claude/settings.json && git commit` 才会随仓库分发。
+- **供应链知情提示**：把该声明写入 tracked 配置并入库 = 任何**克隆并信任本仓库**的人会被 Claude Code 提示安装此 marketplace + 插件——这是你作为项目主人**主动的分发决定**，会影响所有队友，请先 review diff 再提交。
+- **版本局限**：声明**只锁「启用哪些插件」，不锁 sha/版本**；克隆者安装的是 marketplace **当前 HEAD 版本**，可能与你本地版本不同。
+
 ## 完整指南
 
 分发渠道、双仓同步、认证排障等完整说明见项目分发指南（plugin-distribution-guide）。
