@@ -159,6 +159,51 @@ spec: docs/stage-01-Harness体系建设/02-体系设计/04-编排中枢-Applicat
 - 边界：阶段 9 **部署参数禁止推测**（模块五「禁止推测部署参数」/ 开发流程规范 DF-007），HITL-4 人工确认不受模型档影响。
 - B 是**建议非强制**：Owner 可在风险阶段（如首次部署、复杂 CI 诊断）上调档位；委派时机的最终判断权留给 Owner。
 
+### 元流程调度指令（M0–M5 · 元流程实例）
+
+> 本小节定**元流程相位调度**（对称本模块 10 阶段调度）。元流程实例（`proj-*`）与 10 阶段实例**平级**——都是 Owner 调度的流程实例，无谁前置谁；元流程产 Roadmap 后进"可重入维护态"，10 阶段并发跑卡（Q1 平等）。
+
+**相位序列**（触发 5 种模式之一 ↓）：
+
+```
+[M0 愿景] → [M0.5 调研（入口 HITL-0.5 人判 RUN/SKIP · 默认 RUN）] → [M1 需求池] → [M2 范围圈定] ↓
+[M3 架构设计（M3.1 系统架构 → M3.2 接口契约 → M3.3 定制规范）] ↓
+[M4 工程基线落地] → [M5 Roadmap 拆解] ↓（进入 10 阶段循环 · 每张 Roadmap 卡 = 一次 10 阶段流水线）
+```
+
+**各 M 阶段总览**（详化文档指针指向 docs · 不复制正文）：
+
+| 阶段 | 名称 | Skill | HITL | 失败回退 | 详化文档 |
+|---|---|---|---|---|---|
+| M0 | 愿景澄清 | `vision-clarification` | ✅ 愿景确认 | — | `02-M0…md` |
+| **M0.5** | 调研(Discovery) | `research-discovery`（抽象契约） | 入口 `HITL-0.5`（人判 RUN/SKIP · **默认 RUN**） | 出口门禁不达标→strategist 补做（≤2 轮） | research-phase 卡 M3 产物（entry-gate/exit-gate） |
+| M1 | 需求池+用户/场景 | `requirement-elicitation` | ✅ 需求池确认 | 重大偏差→M0 | `03-M1…md` |
+| M2 | 范围圈定 | `scope-framing` | ✅ 范围确认 | 范围争议→M1 | `04-M2…md` |
+| M3 | 架构设计（3 子阶段连贯跑 M3.1→M3.2→M3.3） | `architecture-design`+`interface-design`+`adr-and-rules-customization` | M3.1/M3.2/M3.3 各一次 ✅ | M3.1↔M0/M1 · M3.2↔M2 · M3.3↔M3.1 | `05-M3…md` |
+| M4 | 工程基线落地 | `engineering-baseline` | ✅ 基线确认 | 落地暴露架构问题→M3 | `06-M4…md` |
+| M5 | Roadmap 拆解 | `roadmap-planning` | ✅ Roadmap 确认 | 拆不出可独立交付卡→M2/M3 | `07-M5…md` |
+
+**循环上限**：每 M 阶段评审 ≤3 轮；M3 三子阶段各 ≤2 轮（任一子阶段>2 轮或 M3 累计返工>3 次→升级人工）。
+
+**M0.5 必经闸（钉死措辞 · 不可弱化）**：
+
+- M0.5 = M0↔M1 间的**独立 substate**（独立阶段位 · **非 M0 出口子阶段**）；状态机用独立 `m0_5_*` 字段族承载。
+- 入口闸 **HITL-0.5（人判 RUN/SKIP · 默认 RUN）**：默认 RUN；仅当 SKIP 三维信号（领域成熟 / 决策可回头 / 范围小）**全部命中**且**无任一 RUN 信号**（novel / 难回头 / 高风险）时方可显式 SKIP（SKIP 须 100% 留痕 · 三边界 B1/B2/B3）。
+- **元流程 5 HITL 扩为含 HITL-0.5**：原 5 个（M0/M1/M2 各一 · M3.1/M3.2/M3.3 各一 · M4/M5 各一）+ 入口 `HITL-0.5`。HITL-0.5 是人判闸，与各 M 阶段出口 HITL 并列。
+- **Owner 铁律**：M0 出口后**必须主动呈现 HITL-0.5**（人判 RUN/SKIP），**禁止 M0→M1 直穿**。RUN 产 `dossier.md`+`open-questions.md`，reviewer 评出口 6 硬门禁（G1–G6 全达标方准入 M1）。
+
+**触发模式 A–E**（由用户在元流程入口**显式声明** + Owner HITL 确认，**不由 Owner 自动推断**）：
+
+| 模式 | 触发场景 | 重入范围 | 继承前序 | 物理承载 |
+|---|---|---|---|---|
+| A · First-Run | 项目 0→1 | M0→M5 全走 | 无 | `proj-init-<date>` |
+| B · Module-Init | MVP 已上线加新模块 | M1→M5 | M0 愿景 | `proj-module-<name>-<date>` |
+| C · Arch-Evolve | 架构重大调整 | M3→M5 | M0/M1/M2 | `proj-arch-<topic>-<date>` |
+| D · Re-Vision | 方向重定位（v2 重启） | M0→M5 | 仅历史参考 | `proj-revision-<date>` |
+| E · Phase-Revise | 单 M 阶段事后修订 | 仅指定 M REOPEN | 全部继承 | 原 `proj-*` 上 REOPEN 不另起 |
+
+> 细节（§2 序列 / §3 触发模式 / §5 阶段表 / §5.1 M0.5 定义）见 `docs/stage-02-全生命周期拓展/02-体系设计/01-元流程总览（M0-M5 + 触发模式 + 分次推进 + 模式 E 状态机）.md`，**不复制全文**（与本模块"门禁判定式见 docs"同体例）。
+
 ---
 
 ## 模块五 · 沟通原则与硬性约束

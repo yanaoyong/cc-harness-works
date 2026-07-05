@@ -1,6 +1,6 @@
 export const meta = {
   name: 'm05-web-research',
-  description: 'M0.5 external-web research engine (L2) — replaces the deprecated built-in L1 deep-research (ADR-010: chain converges to L2(primary)→L3(degrade)). Scope a question, fan out parallel WebSearch angles, fetch+extract falsifiable claims, adversarially N-vote verify (abstain-quorum), then synthesize a cited report. Vendor-neutral by default (agents inherit the session model); optional cost controls = model tiers + fan-out knobs + a lite profile, with a hard Sonnet floor on Verify/Synthesize. Ported from the bughunter 5-phase pipeline, WebSearch/WebFetch swapped for git/grep.',
+  description: 'M0.5 external-web research engine (L2) — replaces the deprecated built-in L1 deep-research (ADR-010: chain converges to L2(primary)→L3(degrade)). Scope a question, fan out parallel WebSearch angles, fetch+extract falsifiable claims, adversarially N-vote verify (abstain-quorum), then synthesize a cited report. Cost-safe by default (tiered preset; opt into session-model inheritance via tier:\'inherit\'); optional cost controls = model tiers + fan-out knobs + a lite profile, with a hard Sonnet floor on Verify/Synthesize. Ported from the bughunter 5-phase pipeline, WebSearch/WebFetch swapped for git/grep.',
   phases: [
     { title: 'Scope', detail: 'decompose the question into independent search angles' },
     { title: 'Search', detail: 'one WebSearch agent per angle (pipeline, no barrier)' },
@@ -44,7 +44,8 @@ const REFUTE_TO_KILL = Math.floor(VOTES / 2) + 1           // refuting votes nee
 
 // ─── model tiers (R3a) — THE ONLY place vendor model ids live (overridable config-data) ───
 // Stage keys map to tier-label values; agent() call-sites reference the RESOLVED map (see opt()), never a
-// literal id, so the AC-4 neutrality grep stays clean. Default (no tier) = empty map = inherit session model.
+// literal id, so the AC-4 neutrality grep stays clean. Default (no tier · non-lite) = cost-safe 'tiered' preset;
+// only an explicit tier:'inherit' returns to an empty map = inherit session model.
 const TIER_PRESETS = {
   haiku:  { Scope: 'haiku',  Search: 'haiku',  Fetch: 'haiku',  Verify: 'haiku',  Synthesize: 'haiku'  },
   sonnet: { Scope: 'sonnet', Search: 'sonnet', Fetch: 'sonnet', Verify: 'sonnet', Synthesize: 'sonnet' },
@@ -53,10 +54,11 @@ const TIER_PRESETS = {
 }
 function buildTierMap(tier, lite) {
   let raw
-  if (tier && typeof tier === 'object') raw = { ...tier }                       // fine-grained per-stage override
+  if (tier === 'inherit') raw = {}                                             // escape hatch (AC-2): explicit opt-back to inheriting the session model (empty map ⇒ opt() omits model)
+  else if (tier && typeof tier === 'object') raw = { ...tier }                  // fine-grained per-stage override
   else if (typeof tier === 'string' && TIER_PRESETS[tier]) raw = { ...TIER_PRESETS[tier] }
   else if (lite) raw = { ...TIER_PRESETS.tiered }                               // lite ⇒ tiered models by default
-  else raw = {}                                                                 // DEFAULT: inherit session model (vendor-neutral)
+  else raw = { ...TIER_PRESETS.tiered }                                         // A1 default: no tier + non-lite ⇒ cost-safe tiered (Scope/Search/Fetch=haiku, Verify/Synthesize=sonnet), NOT raw session-model inherit
   // R-风1 hard floor: Verify/Synthesize must NEVER run on the cheapest tier — an under-powered adversarial
   // verifier loses falsification rigor and lets weak claims slip through; synthesis quality collapses too.
   // Enforced in code even if a caller explicitly asks for haiku there (bounced up + logged).
@@ -79,6 +81,24 @@ const degraded = (reason, extra = {}) => ({
   note: 'capability-degraded: explicit non-coverage — caller must map to explicit_na, never report "covered" or fabricate an engine tier.',
   ...extra,
 })
+
+// ─── B hard-gate (AC-3): refuse to fan out on an undecided (possibly flagship) session model ───
+// Root cause of the cost blow-up: manual/direct calls that pass neither `tier` nor `profile` used to inherit
+// whatever session model was active (e.g. a flagship tier) × the full non-lite fan-out (Scope+Search+Fetch +
+// claims×votes Verify + Synthesize ≈ dozens of agents) → quota drain. Decision ②B-a: non-lite with NO cost
+// decision at all = reject BEFORE any fan-out. `profile:'lite'` sets a.profile; an explicit `tier` (incl. the
+// 'inherit' escape hatch, which sets a.tier) both count as "cost decision given" and pass through. We return a
+// SELF-IDENTIFYING shape ({ needsCostDecision }) — NOT degraded()/error — so callers/entry-gate don't mis-map
+// this to explicit_na/L3 (web-unavailable). No Scope/Search/Fetch/Verify agent is ever started.
+if (a.tier === undefined && a.profile === undefined) {
+  return {
+    needsCostDecision: true,
+    engine: 'm05-web-research',
+    question: Q,
+    reason: 'no cost decision provided (neither tier nor profile) for a non-lite fan-out — refusing to inherit an undecided session model × large fan-out',
+    hint: "pass tier:'haiku'|'sonnet'|'opus'|'tiered'|'inherit', or profile:'lite', to set a cost tier before fan-out（避免继承任意会话模型 × 大扇出烧额度）",
+  }
+}
 
 // ─── Schemas ───
 const SCOPE_SCHEMA = {

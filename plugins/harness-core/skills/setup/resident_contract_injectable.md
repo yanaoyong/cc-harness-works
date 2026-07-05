@@ -138,6 +138,34 @@ Owner 委派任何 `generator` / `reviewer` 子 Agent 时，prompt **必须**包
 
 ---
 
+## 元流程调度锚点（M0–M5 · L1）
+
+> 本节定 **WHERE**（M0.5 是必经相位 / 序列位置），下方「M0.5 调研能力纪律」节定 **HOW**（M0.5 怎么跑 / 引擎档位）——**两节职责正交**。
+
+**相位序列**：`M0 → M0.5 → M1 → M2 → M3 → M4 → M5`（M3 = M3.1→M3.2→M3.3 三子阶段连贯跑）。元流程实例（`proj-*`）与 10 阶段实例平级。
+
+**M0.5 必经闸锚点**：
+
+- M0.5 = M0↔M1 间**独立 substate**（独立阶段位 · **非 M0 出口子阶段**）；状态机用独立 `m0_5_*` 字段族承载。
+- 入口 **HITL-0.5 人判 RUN/SKIP · 默认 RUN**（SKIP 须三维信号全命中且无 RUN 信号 + 100% 留痕）。
+- **Owner 铁律**：M0 出口后**须主动呈现 HITL-0.5**、**禁 M0→M1 直穿**。RUN 产 `dossier.md`+`open-questions.md`，reviewer 评出口 6 硬门禁（G1–G6）。
+
+**元流程 HITL 点**：入口 `HITL-0.5` + M0/M1/M2 各出口 + M3.1/M3.2/M3.3 各出口 + M4/M5 各出口确认（**元流程 HITL 与 10 阶段 HITL-1~5 属不同层级**，勿混）。
+
+**触发模式 A–E**（用户入口显式声明 + Owner HITL 确认 · **不由 Owner 自动推断**）：
+
+| 模式 | 触发场景 | 重入范围 | 继承 | 承载 |
+|---|---|---|---|---|
+| A · First-Run | 项目 0→1 | M0→M5 | 无 | `proj-init-<date>` |
+| B · Module-Init | 加新模块 | M1→M5 | M0 | `proj-module-<name>-<date>` |
+| C · Arch-Evolve | 架构重调 | M3→M5 | M0/M1/M2 | `proj-arch-<topic>-<date>` |
+| D · Re-Vision | v2 重启 | M0→M5 | 仅历史参考 | `proj-revision-<date>` |
+| E · Phase-Revise | 单 M 事后修订 | 仅指定 M REOPEN | 全部 | 原 `proj-*` REOPEN |
+
+> 权威源：`.harness/agents/application-owner.md`「元流程调度指令（M0–M5）」小节（细节承载）。本节只放锚点 + 指针，**不复制 docs 正文**。
+
+---
+
 ## M0.5 调研能力纪律（L1/L 通道）
 
 > 来源：承接 ADR-008（厂商无关引擎绑定 + 原三级降级链）+ ADR-009（外部 web 检索传输层修复 + 三级链「假冗余」诊断 + L2 机制解耦）+ **ADR-010**（弃用 L1 + 链收敛 `L2(主)→L3(降级)` + L2 独立名消除命名碰撞）+ research-discovery 能力（`.harness/skills/research-discovery/SKILL.md` 抽象契约 · 厂商无关 · 仅声明 `capability_required="fan-out retrieval over A/B/C"` 不点名）。
