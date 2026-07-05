@@ -4,7 +4,7 @@
 #       存量项目则执行镜像单向自动同步（drift-sync：plugin 缓存 → 只读镜像 · ADR-013 裁决③⑤⑥）。
 #
 # 触发逻辑：
-#   ① first-run 守卫：检查 $CLAUDE_PLUGIN_DATA/.scaffold_initialized，已初始化则走 drift-sync 后退出
+#   ① first-run 守卫：检查项目内 $TOP/.harness/state/.scaffold_initialized，已初始化则走 drift-sync 后退出
 #   ② 若 .harness/changes/ 不存在 → 执行脚手架安装（新项目初始化）
 #   ③ 若 .harness/changes/ 已存在 → 执行 drift-sync 单向自动同步（存量项目）
 #   ④ 无 HARNESS_CONFIG.yaml 时仍触发 _scaffold_new_project（新用户场景）
@@ -26,8 +26,10 @@
 # 原「删除不复活」单语义已按 ADR-013 裁决⑤ 改写为对象级双语义）：
 #   - 失败重试：脚手架安装有警告（had_error=1）时不落哨兵 → 将于下会话重试；每会话刷 warning 属预期行为，
 #     直至一次全成功落哨兵为止
-#   - 位置回退：STATE_DIR="${CLAUDE_PLUGIN_DATA:-$TOP/.harness/state}"——未设 CLAUDE_PLUGIN_DATA 时
-#     哨兵落 $TOP/.harness/state（仓库根绝对路径，不落 cwd）
+#   - 落点（项目本地 · fix-statedir-crossproject-leak-20260705 · ADR-016）：
+#     STATE_DIR 恒项目本地 $TOP/.harness/state（仓库根绝对路径，不落 cwd）；
+#     HARNESS_STATE_DIR 为可选覆盖逃生口。**不再取 CLAUDE_PLUGIN_DATA（宿主按插件全局，
+#     会致跨项目哨兵泄漏——本卡 ADR-016 修复）**。
 #   - 删除语义（对象级双语义 · ADR-013 裁决⑤）：
 #     * 镜像件（.harness/skills|agents|rules|commands + workflows 同步件〔.harness/workflows 与
 #       .claude/workflows〕）：删除=漂移的删除形态 → drift-sync 自动复活（权威源=plugin 缓存 · 单向）；
@@ -132,6 +134,8 @@ _write_mirror_baseline() {
     done < <(find "$src" -type f 2>/dev/null)
   done < <(_mirror_pairs)
   mkdir -p "$STATE_DIR" 2>/dev/null
+  # 自忽略：STATE_DIR 现项目本地（ADR-016），幂等写 `*` 防运行时哨兵/日志被 commit（不依赖消费方根 .gitignore）
+  [ -f "$STATE_DIR/.gitignore" ] || printf '*\n' > "$STATE_DIR/.gitignore" 2>/dev/null
   if mv -f "$tmp" "$BASELINE_FILE" 2>/dev/null; then
     log_info "✅ 镜像基线已记录：$BASELINE_FILE"
   else
@@ -224,6 +228,7 @@ _maybe_auto_bootstrap() {
   # 标记（「曾在 first-run 发起过」语义纯净）。
   if [ "$1" = "first-run" ]; then
     mkdir -p "$STATE_DIR" 2>/dev/null
+    [ -f "$STATE_DIR/.gitignore" ] || printf '*\n' > "$STATE_DIR/.gitignore" 2>/dev/null  # 自忽略（ADR-016）
     touch "$STATE_DIR/.bootstrap_attempted" 2>/dev/null
   fi
 
@@ -368,6 +373,7 @@ _scaffold_new_project() {
   if [ "$had_error" -eq 0 ]; then
     # 标记首次运行完成 + 记录镜像基线（drift-sync 定制保护的比对起点 · 裁决⑥）
     mkdir -p "$STATE_DIR"
+    [ -f "$STATE_DIR/.gitignore" ] || printf '*\n' > "$STATE_DIR/.gitignore" 2>/dev/null  # 自忽略（ADR-016）
     touch "$STATE_DIR/.scaffold_initialized"
     _write_mirror_baseline
     log_info "脚手架安装完成 ✅"
@@ -471,6 +477,7 @@ _drift_sync() {
 
   # 基线收敛写入（内容不变则不重写，保证收敛后零写入幂等）
   mkdir -p "$STATE_DIR" 2>/dev/null
+  [ -f "$STATE_DIR/.gitignore" ] || printf '*\n' > "$STATE_DIR/.gitignore" 2>/dev/null  # 自忽略（ADR-016）
   if [ -f "$BASELINE_FILE" ] && cmp -s "$tmp" "$BASELINE_FILE" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null
   else
@@ -528,10 +535,10 @@ PLUGIN_RULES="$PLUGIN_ROOT/rules"
 
 # ============================================================
 # first-run 守卫（T2 · fix-plugin-self-rebuild)
-# 首次会话运行全量重建，后续跳过（CLAUDE_PLUGIN_DATA/.scaffold_initialized）
+# 首次会话运行全量重建，后续跳过（项目内 .harness/state/.scaffold_initialized · ADR-016）
 # ============================================================
 
-STATE_DIR="${CLAUDE_PLUGIN_DATA:-$TOP/.harness/state}"
+STATE_DIR="${HARNESS_STATE_DIR:-$TOP/.harness/state}"
 if [ -f "$STATE_DIR/.scaffold_initialized" ]; then
   # 已初始化，走镜像单向自动同步后退出（路径变量已就绪）
   _drift_sync
