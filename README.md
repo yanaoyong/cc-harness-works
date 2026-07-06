@@ -74,6 +74,19 @@ export HARNESS_AUTO_BOOTSTRAP=0        # 环境变量逃生阀
 
 从旧版（哨兵落全局）升级的项目，因哨兵落点改为项目本地，**首次会话可能重跑一次 bootstrap**。这是一次性迁移副作用，幂等无害（已装好的引擎 / 索引 / wiki 骨架各步骤会自动跳过）。
 
+## 插件升级后 · 脚手架怎么更新
+
+升级插件后（`/plugin marketplace update cc-harness-works` + `/reload-plugins`），**大部分脚手架会自动更新**：hooks / commands / workflows / skills / agents / rules 在下个会话由 drift-sync 从新版插件缓存**单向刷新**（你本地改过的镜像文件会被识别为定制、告警跳过、**绝不覆盖你的改动**）。所以规则 / 流程 / 工作流类的修复，升级 + 重载后即自动生效，无需手工干预。
+
+> ⚠️ **重点：引擎组件不随插件升级自动刷新，需手动重跑 bootstrap。**
+> `.harness/components/`（codegraph / wiki-engine 的二进制 + 注册脚本）只在**首次** bootstrap 落盘；成功哨兵 `.bootstrap_done` 无版本戳，不会随插件升级自动重跑。**若某次发版更新了引擎组件，请手动执行一次**（全步骤幂等，已就绪的步骤自动跳过）：
+>
+> ```
+> /harness-core:bootstrap
+> ```
+
+此外 `_TEMPLATE`（变更卡模板）为 no-clobber——存在即不覆盖。发版若改了模板结构，需手动删除 `.harness/changes/_TEMPLATE`，下个会话会自动从新版补齐。
+
 ## 随项目分发插件声明 · /harness-core:pin-to-project
 
 装好插件后，如果你是项目主人、希望**队友克隆仓库即被提示装好同一套插件**（免去每人手工 `/plugin marketplace add` + `/plugin install`），可主动运行：
