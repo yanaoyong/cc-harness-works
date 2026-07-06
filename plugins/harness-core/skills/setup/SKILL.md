@@ -3,8 +3,8 @@ name: setup
 trigger: 用户显式调用 `/setup`（hook 被禁用时的降级回退）
 inputs: 无
 outputs: 常驻契约注入内容展示 + 脚手架位置提示
-version: 1.0.0
-updated: 2026-06-28
+version: 1.1.0
+updated: 2026-07-06
 spec: docs/stage-01-Harness体系建设/02-体系设计/06-Skills技能体系规范.md
 ---
 
@@ -26,6 +26,23 @@ spec: docs/stage-01-Harness体系建设/02-体系设计/06-Skills技能体系规
 1. **注入常驻契约**：读取并展示 `resident_contract_injectable.md` 的完整内容
 2. **提示脚手架位置**：引导用户找到 `_TEMPLATE` 等脚手架资源（为 RM-2026-141 预留接口）
 
+## 3.5 硬守卫 · CLAUDE.md @import 常驻检测（注入前必须执行 · 不是可选提示）
+
+> 来源：feat-claudemd-full-restore-20260706（AC-3c）。与 SessionStart hook 守卫①.5 同款双串检测，防双份加载。
+
+**执行注入（§4 功能1）之前，必须先检查仓库根 `CLAUDE.md` 是否已含 application-owner.md 的 @import**（双串枚举，`grep -F` 字面匹配）：
+
+```bash
+TOP="$(git rev-parse --show-toplevel)"
+grep -F '@.harness/agents/application-owner.md' "$TOP/CLAUDE.md" 2>/dev/null
+grep -F '@plugins/harness-core/agents/application-owner.md' "$TOP/CLAUDE.md" 2>/dev/null
+```
+
+- **任一串命中** → **不注入**（禁止展示 `resident_contract_injectable.md` 内容），改为提示用户："CLAUDE.md 已全量常驻（@import 命中），注入冗余，已跳过"。脚手架落盘检查（§7 功能2）照常执行。
+- **两串均不命中**（含 CLAUDE.md 不存在）→ 照常按 §4 手动注入。
+
+本守卫为**硬守卫**：命中即不注入，不得以"用户显式调用了 /setup"为由绕过。
+
 ## 4. 使用方法
 
 ```
@@ -33,6 +50,7 @@ spec: docs/stage-01-Harness体系建设/02-体系设计/06-Skills技能体系规
 ```
 
 调用后，本 skill 会：
+- **先执行 §3.5 硬守卫检测**（命中 @import 则不注入）
 - 读取 `.harness/skills/setup/resident_contract_injectable.md`
 - 将完整内容展示给你
 - 提示：常驻契约已手动注入，可继续工作

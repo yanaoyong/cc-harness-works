@@ -354,17 +354,8 @@ _scaffold_new_project() {
     log_info "✅ workflows 已同步到 .claude/workflows/"
   fi
 
-  # 8. 提示用户创建 CLAUDE.md
-  if [ ! -f "$TOP/CLAUDE.md" ]; then
-    log_info ""
-    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    log_info "📋 Harness 项目初始化完成！"
-    log_info ""
-    log_info "下一步：请创建 CLAUDE.md 以激活 Harness 编排中枢。"
-    log_info "参考模板：$PLUGIN_ROOT/CLAUDE.md.template"
-    log_info "（或复制 .harness/agents/application-owner.md 的注释段）"
-    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  fi
+  # 8.（已收敛 · feat-claudemd-full-restore-20260706 T1）原"仅提示创建 CLAUDE.md"逻辑
+  #    收敛进 _restore_claudemd（主流程三条收尾路径 exit 前统一调用 · create-if-missing 实际复原）。
 
   # 9.（已撤 · ADR-013 裁决①）commands → .claude/commands/ 二次同步不再产生：
   #    官方 loader 以命名空间 /harness-core:* 原生加载 commands，平铺副本与之撞车且脱离更新链。
@@ -500,6 +491,73 @@ _drift_sync() {
 }
 
 # ============================================================
+# 函数：CLAUDE.md 每会话 create-if-missing 复原
+# （feat-claudemd-full-restore-20260706 T1）
+#   - 判定语义：$TOP/CLAUDE.md 缺失 → 从模板复原；存在（含空文件/用户自建任意内容/符号链接）
+#     → 绝不触碰（byte-identical）
+#   - 模板定位：$PLUGIN_ROOT/CLAUDE.md.template，含 plugin 缓存/开发态回退（对齐 _locate_* 先例）
+#   - 剥离模板头注释（OQ-4）：第一个 `---` 分隔线（含）之前的"使用说明"注释块不落地，
+#     代之以一行干净标题 `# CLAUDE.md —— Harness 引导器`
+#   - 哨兵：复原成功后 touch $STATE_DIR/.claudemd_restored_pending（供 contract hook 首会话桥接
+#     消费 · T2 并行实现，哨兵名已定死）
+#   - 不进 _mirror_pairs / drift-sync 基线（只补缺、不保鲜内容）
+#   - 失败软化：模板定位失败/写入失败 → stderr 提示后跳过，永不阻断会话
+#   - 调用点：主流程三条收尾路径 exit 前统一调用（@import 目标文件此时已落盘 · 顺序硬约束）
+# ============================================================
+
+_restore_claudemd() {
+  # 存在（含空文件/任意内容/符号链接，含悬空链接）→ 绝不触碰
+  if [ -e "$TOP/CLAUDE.md" ] || [ -L "$TOP/CLAUDE.md" ]; then
+    return 0
+  fi
+
+  # 模板定位（回退链：PLUGIN_ROOT → CLAUDE_PLUGIN_ROOT plugin 缓存 → 本仓开发态）
+  local tpl=""
+  if [ -f "$PLUGIN_ROOT/CLAUDE.md.template" ]; then
+    tpl="$PLUGIN_ROOT/CLAUDE.md.template"
+  elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/CLAUDE.md.template" ]; then
+    tpl="${CLAUDE_PLUGIN_ROOT}/CLAUDE.md.template"
+  elif [ -f "$TOP/plugins/harness-core/CLAUDE.md.template" ]; then
+    tpl="$TOP/plugins/harness-core/CLAUDE.md.template"
+  fi
+  if [ -z "$tpl" ]; then
+    log_warn "CLAUDE.md 缺失且未找到模板 CLAUDE.md.template（PLUGIN_ROOT / plugin 缓存 / 开发态均无），跳过复原；可手动参考 plugins/harness-core/CLAUDE.md.template 创建"
+    return 0
+  fi
+
+  # 写入：剥离第一个 `---` 分隔线（含）之前的头注释块，冠以干净标题（OQ-4）；
+  # 模板异常无 `---` 分隔线时整文照抄（保守回退，不产出仅剩标题的空壳）
+  if grep -q '^---[[:space:]]*$' "$tpl" 2>/dev/null; then
+    {
+      printf '# CLAUDE.md —— Harness 引导器\n'
+      awk 'found { print } !found && /^---[[:space:]]*$/ { found=1 }' "$tpl"
+    } > "$TOP/CLAUDE.md" 2>/dev/null
+  else
+    cp "$tpl" "$TOP/CLAUDE.md" 2>/dev/null
+  fi
+  if [ ! -s "$TOP/CLAUDE.md" ]; then
+    log_warn "CLAUDE.md 复原写入失败（$TOP/CLAUDE.md），跳过（不阻断会话）"
+    rm -f "$TOP/CLAUDE.md" 2>/dev/null
+    return 0
+  fi
+
+  # 哨兵：供 contract hook 首会话桥接消费（T2 并行实现 · 哨兵名已定死）
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  [ -f "$STATE_DIR/.gitignore" ] || printf '*\n' > "$STATE_DIR/.gitignore" 2>/dev/null  # 自忽略（ADR-016）
+  touch "$STATE_DIR/.claudemd_restored_pending" 2>/dev/null
+
+  # 占位符提示（原 _scaffold_new_project 步骤 8"仅提示"逻辑收敛至此）
+  log_info ""
+  log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  log_info "📋 已复原 CLAUDE.md（Harness 引导器 · 来自 $tpl）"
+  log_info ""
+  log_info "请按项目实际情况填写其中的占位符："
+  log_info "  <项目名称> / <描述项目模块结构> / <描述技术栈>"
+  log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  return 0
+}
+
+# ============================================================
 # 守卫：定位仓库根
 # ============================================================
 
@@ -542,6 +600,7 @@ STATE_DIR="${HARNESS_STATE_DIR:-$TOP/.harness/state}"
 if [ -f "$STATE_DIR/.scaffold_initialized" ]; then
   # 已初始化，走镜像单向自动同步后退出（路径变量已就绪）
   _drift_sync
+  _restore_claudemd  # 收尾路径 (A)：drift-sync 之后 create-if-missing 复原 CLAUDE.md（T1）
   exit 0
 fi
 
@@ -553,6 +612,7 @@ fi
 if [ ! -f "$TOP/HARNESS_CONFIG.yaml" ]; then
   # 无配置文件 → 新项目，触发全量初始化
   _scaffold_new_project
+  _restore_claudemd  # 收尾路径 (B)：scaffold 镜像落盘（agents/rules 等 @import 目标）之后复原（T1）
   exit 0
 fi
 
@@ -565,5 +625,7 @@ if [ -d "$CHANGES_DIR" ]; then
 else
   _scaffold_new_project
 fi
+
+_restore_claudemd  # 收尾路径 (C)：未初始化二分（legacy 重试态 drift-sync / 新项目 scaffold）之后复原（T1）
 
 exit 0
