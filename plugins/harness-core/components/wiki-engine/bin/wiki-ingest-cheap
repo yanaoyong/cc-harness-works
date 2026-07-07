@@ -5,7 +5,9 @@
 #   例：wiki-ingest-cheap "$(cat batch-prompt.txt)" --output-format json --max-turns 100
 #
 # 环境变量：
-#   DEEPSEEK_API_KEY          必填。key 只进进程环境，不进 URL/stdout/日志。
+#   DEEPSEEK_API_KEY          必填。env 缺失时从组件根 wiki-ingest.env 加载（gitignored
+#                             本地 env · 一次写入长期复用 · 模板 wiki-ingest.env.example）。
+#                             key 只进进程环境，不写进被追踪/日志的文件（gitignored env 除外）。
 #   WIKI_ENGINE_INGEST_MODEL  摄取档模型，默认 deepseek-v4-flash
 #                             （选型见 docs/benchmark-pro-vs-flash.md：flash 真实账单
 #                              便宜 ~2.4×、问答质量与 pro 持平；代价是偶发纪律漂移，
@@ -40,8 +42,16 @@ if [ "${1}" = "-h" ] || [ "${1}" = "--help" ]; then
   usage
   exit 0
 fi
+# key 文件化（feat-wiki-auto-ingest-b2 · U2）：env 无 DEEPSEEK_API_KEY 时，从组件根的本地
+# gitignored env 文件加载（一次写入长期复用；模板 wiki-ingest.env.example）。脚本有 set -e，
+# 先 [ -f ] 判存在再 source，防不存在文件时 source 崩溃（对齐 spec T3 / reviewer v2 INFO②）。
+WIKI_INGEST_ENV_FILE="$(dirname "$BIN_DIR")/wiki-ingest.env"
+if [ -z "${DEEPSEEK_API_KEY:-}" ] && [ -f "$WIKI_INGEST_ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$WIKI_INGEST_ENV_FILE"
+fi
 if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
-  echo "wiki-ingest-cheap: DEEPSEEK_API_KEY 未设置（key 不要写进文件/URL/日志）" >&2
+  echo "wiki-ingest-cheap: DEEPSEEK_API_KEY 未设置（可写入本地 gitignored ${WIKI_INGEST_ENV_FILE##*/}；key 不写进被追踪/日志的文件）" >&2
   exit 2
 fi
 

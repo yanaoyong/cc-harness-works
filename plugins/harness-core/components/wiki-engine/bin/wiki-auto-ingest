@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# wiki-auto-ingest — B2 自动摄取编排（feat-wiki-auto-ingest-b2 · ADR-010 B2 落地）。
+#
+# 兑现 ADR-010 后置的 B2：把「检测后自动摄取」补成能力。检测 new/changed delta
+# （复用 wiki-rescan · read-only）→ 有 delta 则跑批循环
+#   begin-batch → wiki-ingest-cheap 摄取 → wiki-lint 六门禁 → commit-batch → git commit
+# （批循环本体复用既有 bin · 不改其逻辑）→ 全程 stderr 留痕。
+#
+# == 命脉红线（严守 ADR-010 三边界 + ADR-005 旁路）==
+# ① 非阻塞：任何失败/降级路径一律 exit 0，永不阻断会话/主流程（AC-2）。
+# ② 只后台异步：本脚本由 Stop hook fire-and-forget 后台启动，不压关键路径（U1）。
+# ③ 优雅降级回退 B1：key 缺失 / ingest 非 0 / lint 不绿 / 出域被拦 / commit-batch 失败
+#    → 丢弃该批不 commit 脏批、stderr 报降级原因、exit 0（AC-3 · 等价 B1 只检测）。
+# 本脚本是**维护侧**（动 wiki 内容新鲜度）· 不进任一门禁 · 不拦 Read · 不夺裁决权。
+#
+# 单次批上限（AC-9）：读 env WIKI_ENGINE_AUTO_INGEST_MAX_BATCHES（默认 3），单次触发最多
+#   摄该批数，余量 stderr 报「余 N 批留下次」不摄（防会话结束后一次自动摄取过激 · 温和默认）。
+# 摄取范围：仅 new + changed 源（deleted 走 --forget + 人工 review 流 · 不在自动范围）。
+# corpus：默认写死 --wiki wiki/，不触背景库 wiki-background/（承 ADR-010 §4）。
+#
+# 用法：
+#   wiki-auto-ingest            检测 + 有 delta 则自动摄取（Stop hook 后台调用形态）
+#   wiki-auto-ingest --dry-run  只检测 + 报计划批次，不执行摄取（AC-1）
+#   wiki-auto-ingest --help
+#
+# 环境变量：DEEPSEEK_API_KEY（缺失时从组件根 wiki-ingest.env 加载 · 见 wiki-ingest-cheap）；
+#   WIKI_ENGINE_AUTO_INGEST_MAX_BATCHES（默认 3）；WIKI_ENGINE_INGEST_MODEL（透传 ingest）。
+#
+# bash 3.2 兼容（对齐 session_start_wiki_freshness.sh NFR-2）：不用关联数组 / mapfile。
+# 明确不加 -e（容错优先 · 任何路径 exit 0）；用显式退出码判定替代 -e 的中途中止。
+set -uo pipefail
+
+PREFIX="[harness:wiki_autoingest]"
+
+# ---- 参数解析（--help / --dry-run） ----
+DRY_RUN=0
+case "${1:-}" in
+  -h|--help)
+    echo "usage: wiki-auto-ingest [--dry-run]" >&2
+    echo "  检测 wiki/ 相对源文档 new/changed delta，有 delta 则批循环自动摄取（B2）。" >&2
+    echo "  --dry-run 只检测报计划批次、不摄取。失败/降级一律 exit 0（非阻塞）。" >&2
+    echo "  env WIKI_ENGINE_AUTO_INGEST_MAX_BATCHES 控单次批上限（默认 3）。" >&2
+    exit 0 ;;
+  --dry-run) DRY_RUN=1 ;;
+  "") : ;;
+  *) echo "$PREFIX 未知参数：$1（支持 --help / --dry-run）" >&2; exit 2 ;;
+esac
+
+# ---- 自定位仓库根；非 git / 定位失败 → 静默 exit 0 ----
+TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+[ -z "$TOP" ] && exit 0
+cd "$TOP" || exit 0
+
+# ---- 守卫①②：wiki/ 与 state.json 存在（缺 → 静默 exit 0 · 退化纯纪律手动摄取） ----
+[ -d "$TOP/wiki" ] || exit 0
+[ -f "$TOP/wiki/_meta/state.json" ] || exit 0
+
+# ---- 守卫③：组件 bin 三级回退链定位（消费方安装态 → 本仓开发态 → plugin 包内） ----
+# 全绝对路径拼接、首个三件齐备即用；先判 CLAUDE_PLUGIN_ROOT 非空防拼假路径。
+BIN_DIR=""
+for cand in \
+  "$TOP/.harness/components/wiki-engine/bin" \
+  "$TOP/plugins/harness-core/components/wiki-engine/bin" \
+  "${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/components/wiki-engine/bin}"; do
+  [ -n "$cand" ] || continue
+  if [ -r "$cand/wiki-rescan" ] && [ -r "$cand/wiki-lint" ] && [ -r "$cand/wiki-ingest-cheap" ]; then
+    BIN_DIR="$cand"
+    break
+  fi
+done
+if [ -z "$BIN_DIR" ]; then
+  echo "$PREFIX 组件 bin 未定位（三级回退链全不命中）· 降级 B1（跳过）" >&2
+  exit 0
+fi
+RESCAN="$BIN_DIR/wiki-rescan"
+LINT="$BIN_DIR/wiki-lint"
+INGEST="$BIN_DIR/wiki-ingest-cheap"
+KEYFILE="$(dirname "$BIN_DIR")/wiki-ingest.env"
+
+# ---- 丢弃脏批（降级公共动作）：还原 wiki/ 到 HEAD（撤本批页面改动 + state.json
+#      current_batch）+ 清未跟踪新页。入口已守卫 wiki 工作树干净，故只回滚本次产生的改动。
+#      git clean 默认不删 gitignored 文件（auto-ingest.log 已 gitignore）→ 日志安全。 ----
+discard_batch() {
+  git checkout -- wiki/ >/dev/null 2>&1 || true
+  git clean -fdq -- wiki/ >/dev/null 2>&1 || true
+}
+
+# ---- 单次批上限（AC-9） ----
+MAX_BATCHES="${WIKI_ENGINE_AUTO_INGEST_MAX_BATCHES:-3}"
+case "$MAX_BATCHES" in
+  ''|*[!0-9]*) MAX_BATCHES=3 ;;
+esac
+if [ "$MAX_BATCHES" -lt 1 ] 2>/dev/null; then MAX_BATCHES=3; fi
+
+# ---- 检测 delta（read-only · 零出站）：wiki-rescan --wiki wiki/ → JSON ----
+rescan_out="$(python3 "$RESCAN" --wiki wiki/ 2>/dev/null)"
+rescan_rc=$?
+if [ "$rescan_rc" -ne 0 ]; then
+  echo "$PREFIX wiki-rescan 检测失败（rc=$rescan_rc）· 跳过本次（不阻断）" >&2
+  exit 0
+fi
+
+# 解析 + §3.1 双刀白名单过滤（denylist · 默认放行、剔除 ✗不转体裁 · WK-I1）：
+# 首行 = "new_n changed_n filtered_n"（filtered_n = 被 denylist 剔除的源数），
+# 其后每行一个**保留（kept）**的 new+changed 源文件路径（不转体裁已剔除）。
+parsed="$(printf '%s' "$rescan_out" | python3 -c '
+import json, re, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+new = d.get("new", [])
+changed = d.get("changed", [])
+
+_TEMPLATE_SEGS = {"_TEMPLATE", "_PROJ_TEMPLATE", "_STAGE_TEMPLATE"}
+_ACCEPT_SEGS = {"cases", "full-cases", "results", "full-results", "review", "runs", "scripts"}
+_BASE_PREFIXES = ("ci_result", "deployment_report", "coding_report", "unit_test_report",
+                  "module_map", "project_analysis_report", "dogfood-sample",
+                  "dogfood-evidence", "scenario-template")
+_REVIEW_RE = re.compile(r"_review_v\d")
+
+def is_denied(path):
+    # 归一化路径分隔符（rescan 返回 posix 相对路径，稳妥处理反斜杠）
+    p = path.replace("\\", "/")
+    segs = [s for s in p.split("/") if s]
+    base = segs[-1].lower() if segs else ""
+    # 刀①：三类模板目录（任一段命中）
+    if any(s in _TEMPLATE_SEGS for s in segs):
+        return True
+    # 刀②：验收层流水目录（.harness/acceptance/ 开头 且 任一段 ∈ 流水目录集）
+    if p.startswith(".harness/acceptance/") and any(s in _ACCEPT_SEGS for s in segs):
+        return True
+    # 刀③：basename 体裁前缀 / _review_v\d 报告类
+    if base.startswith(_BASE_PREFIXES):
+        return True
+    if _REVIEW_RE.search(base):
+        return True
+    # 刀④：变更目录内 / 验收导航 README
+    if base in ("readme.md", "readme") and (".harness/changes/" in p or ".harness/acceptance/" in p):
+        return True
+    return False
+
+kept = []
+filtered = 0
+for f in new + changed:
+    if is_denied(f):
+        filtered += 1
+    else:
+        kept.append(f)
+print("%d %d %d" % (len(new), len(changed), filtered))
+for f in kept:
+    print(f)
+' 2>/dev/null)"
+parse_rc=$?
+if [ "$parse_rc" -ne 0 ] || [ -z "$parsed" ]; then
+  echo "$PREFIX wiki-rescan 输出解析失败 · 跳过本次（不阻断）" >&2
+  exit 0
+fi
+
+# 首行拆计数（三字段 new_n changed_n filtered_n · 稳健 set -- 拆分，避免 ##/%% 错位）；
+# 其余行（已 denylist 过滤的 kept 源）入 FILES（bash 3.2：indexed 数组 + while-read，不用 mapfile）
+counts_line="$(printf '%s\n' "$parsed" | head -1)"
+set -- $counts_line
+new_n="${1:-0}"
+changed_n="${2:-0}"
+filtered_n="${3:-0}"
+FILES=()
+_ln=0
+while IFS= read -r f; do
+  _ln=$((_ln + 1))
+  [ "$_ln" -eq 1 ] && continue
+  [ -n "$f" ] && FILES+=("$f")
+done <<EOF
+$parsed
+EOF
+n=${#FILES[@]}
+
+# ---- 无 kept 源 → 空转 exit 0（区分「本无 delta」vs「delta 全为不转体裁被剔」） ----
+if [ "$n" -eq 0 ]; then
+  if [ "$filtered_n" -gt 0 ] 2>/dev/null; then
+    echo "$PREFIX delta 全为不转体裁（过滤掉 $filtered_n 源 · 无值转源可摄）· 空转 exit 0" >&2
+  else
+    echo "$PREFIX wiki 新鲜（无未摄取 delta · new=0 changed=0）" >&2
+  fi
+  exit 0
+fi
+
+# ---- 计划批次（每批 ≤5 源 · 应用上限） ----
+BATCH_SIZE=5
+total_batches=$(( (n + BATCH_SIZE - 1) / BATCH_SIZE ))
+do_batches=$total_batches
+if [ "$total_batches" -gt "$MAX_BATCHES" ]; then
+  do_batches=$MAX_BATCHES
+fi
+
+# ---- dry-run：只报计划、不摄取（AC-1 · 与 key 就绪无关） ----
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "$PREFIX [dry-run] new=$new_n changed=$changed_n · 过滤掉 $filtered_n 源（不转体裁）· 剩 $n 值转源入批 · $total_batches 批 · 将摄 $do_batches 批（上限 $MAX_BATCHES）· 不执行摄取" >&2
+  exit 0
+fi
+
+# ---- key 就绪门（缺失 → 降级 B1：报计数不摄取 · AC-3） ----
+if [ -z "${DEEPSEEK_API_KEY:-}" ] && [ ! -f "$KEYFILE" ]; then
+  echo "$PREFIX 有 delta（new=$new_n changed=$changed_n）但 DEEPSEEK_API_KEY 缺失（env 与 $KEYFILE 均无）· 降级 B1（只检测报计数 · 不摄取）" >&2
+  exit 0
+fi
+
+# ---- 脏树守卫：wiki/ 工作树须干净（保护未提交 wiki 改动 + 保证 discard 只回滚本次） ----
+if [ -n "$(git status --porcelain -- wiki/ 2>/dev/null)" ]; then
+  echo "$PREFIX wiki/ 工作树非干净（有未提交改动或残留批次）· 跳过本次自动摄取（避免破坏未提交改动）· 降级 B1" >&2
+  exit 0
+fi
+
+echo "$PREFIX 检测到 delta：new=$new_n changed=$changed_n · 过滤掉 $filtered_n 源（不转体裁）· 剩 $n 值转源入批（$total_batches 批 · 本次摄 $do_batches 批 · 上限 $MAX_BATCHES）" >&2
+
+# ---- 批循环（begin → ingest → lint → commit-batch → git commit） ----
+i=0
+b=0
+while [ "$b" -lt "$do_batches" ]; do
+  slice=( "${FILES[@]:i:BATCH_SIZE}" )
+  cnt=${#slice[@]}
+  [ "$cnt" -eq 0 ] && break
+  b=$((b + 1))
+  batch_id="auto-$(date -u +%Y%m%dT%H%M%SZ)-$$-$b"
+
+  # a. begin-batch（登记批次 + log 快照）。失败（如残留批次）→ 降级 B1 停止。
+  if ! python3 "$RESCAN" --wiki wiki/ --begin-batch "$batch_id" --files "${slice[@]}" >/dev/null 2>&1; then
+    echo "$PREFIX 批 $batch_id begin-batch 失败 · 停止本次自动摄取（降级 B1）" >&2
+    exit 0
+  fi
+
+  # b. 摄取会话（DeepSeek 无头 · key/出域由 wiki-ingest-cheap 承载）。
+  #    增量批：读既有页 + 源 → 合并；矛盾/重复/缺页登记 reviews.md 不静默改写既有结论。
+  files_list="$(printf '  - %s\n' "${slice[@]}")"
+  prompt="任务：wiki 增量摄取，批次 ${batch_id}。当前目录是仓库根，wiki 根 = wiki/。
+本批源文件（new/changed）：
+${files_list}
+步骤：
+1. 逐个完整读取本批源文件。
+2. 为每个源文件创建/更新对应页面（frontmatter 严格用模板 references/schema.md §2）；
+   正文 400–900 字提炼；关键结论注明出处；互链只允许指向已存在或本批将创建的页面。
+   增量合并纪律：读既有页 + 读源 → 合并；与既有页结论矛盾 / 内容重复 / 应建未建 →
+   按格式登记 wiki/_meta/reviews.md，禁止静默改写既有页结论、禁止把矛盾说法混入正文。
+3. 更新 wiki/index.md：保留已有内容，为新页面追加导航行。
+4. wiki/_meta/log.md 末尾追加本批条目（只许追加）。
+5. 直接执行（勿加 python3 前缀 · 用本会话顶部声明的权威绝对路径）：wiki-lint --wiki wiki/；
+   非 0 则按 JSON 报告修复重跑，直到 exit 0。
+禁止：改源文件；改 wiki/_meta/state.json；跑 wiki-rescan --commit-batch。
+完成标志：wiki-lint exit 0。最后单独输出一行：LINT-GREEN"
+
+  if ! bash "$INGEST" "$prompt" >/dev/null 2>&1; then
+    echo "$PREFIX 批 $batch_id 摄取会话非 0（key 缺 / 出域被拦 / 引擎错）· 丢弃该批不 commit · 降级 B1" >&2
+    discard_batch
+    exit 0
+  fi
+
+  # c. 编排方独立重跑 lint（无头会话自称绿不算数）。不绿 → 丢弃脏批不 commit（AC-2）。
+  if ! python3 "$LINT" --wiki wiki/ >/dev/null 2>&1; then
+    echo "$PREFIX 批 $batch_id wiki-lint 不绿 · 丢弃该批不 commit（永不 commit 脏批）· 降级 B1" >&2
+    discard_batch
+    exit 0
+  fi
+
+  # d. commit-batch（写回 manifest + 清批）。失败 → 丢弃脏批降级。
+  if ! python3 "$RESCAN" --wiki wiki/ --commit-batch >/dev/null 2>&1; then
+    echo "$PREFIX 批 $batch_id commit-batch 失败 · 丢弃该批 · 降级 B1" >&2
+    discard_batch
+    exit 0
+  fi
+
+  # e. git commit 本批（best-effort · 路径限定 wiki/ · 不含无关暂存改动 · 绝不 push）。
+  #    auto-ingest.log 已 gitignore → 不入提交。commit 失败仅提示、非阻断（下次脏树守卫会跳过）。
+  if git add -A -- wiki/ >/dev/null 2>&1 \
+     && git commit -q -m "chore(wiki): B2 auto-ingest 批 ${batch_id}（${cnt} 源）" -- wiki/ >/dev/null 2>&1; then
+    echo "$PREFIX 批 $batch_id 已摄取并 commit（$cnt 源）" >&2
+  else
+    echo "$PREFIX 批 $batch_id manifest 已更新但 git commit 失败（非阻断 · 工作树留待人工提交 · 下次自动摄取将被脏树守卫跳过）" >&2
+  fi
+
+  i=$((i + BATCH_SIZE))
+done
+
+# ---- 余量提示（超上限 · AC-9） ----
+if [ "$total_batches" -gt "$do_batches" ]; then
+  echo "$PREFIX 余 $(( total_batches - do_batches )) 批留下次触发续摄（单次上限 WIKI_ENGINE_AUTO_INGEST_MAX_BATCHES=$MAX_BATCHES）" >&2
+fi
+
+exit 0

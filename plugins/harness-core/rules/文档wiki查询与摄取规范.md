@@ -130,6 +130,8 @@ updated: 2026-06-22
 
 > 承接 api-design.md §3.3 卡收尾增量摄取契约 + data-lifecycle.md §3 + ADR-010（摄取触发 hook 决策）。**10 阶段卡阶段10 / 元流程 M 阶段 PASSED 时**触发；触发形态 = **非阻塞维护 hook 自动检测（SessionStart detect-only 首选 / Stop 备选）+ 可选异步摄取 + 纪律兜底**（hook 缺位则退化为人手 WK-S 手动摄取 · 增强非依赖）。**不阻塞主流程交付**（checklist 提示 / hook exit 0 永不阻断 · 非门禁 · O-003 · C-A9）。
 
+> **B2 auto-ingest 已落地（2026-07-07 · `feat-wiki-auto-ingest-b2-20260707`）**：上文「可选异步摄取」原由 ADR-010 定为后置增强（detect-only 起步 · B2 起步不上），现已兑现落地——Stop hook（`session_stop_wiki_autoingest.sh` · 会话结束 fire-and-forget 后台 detach · 不阻塞 Stop 退出）编排 `wiki-auto-ingest`（检测 delta → **§3.1 双刀白名单过滤（denylist · 只入值转体裁 · 剔 ✗不转报告体裁/模板目录/验收流水 · 守 WK-I1 MUST）** → begin-batch → ingest-cheap → wiki-lint 六门禁 → exit 0 才 commit-batch · 单次批上限 env `WIKI_ENGINE_AUTO_INGEST_MAX_BATCHES` 默认 3 · 温和默认 · 余量下次续摄）。**触发为 opt-in**：Stop hook 首门守 `WIKI_ENGINE_AUTO_INGEST=1` 显式启用（**默认关** · 防环境有 key 即每次会话结束 live-fire 失控摄取 · 手动 CLI/`--dry-run` 不受门约束）。key 缺失（env 与 `wiki-ingest.env` 均无）/ 守卫不全 / ingest 非 0 / lint 不绿 / 出域被拦一律**优雅降级回退 B1 detect-only**（永不阻断 · 全路径 exit 0 · 不 commit 脏批）。故 WK-S1/WK-S3 的「可选异步摄取」自此为**实装能力**而非纯设计倾向；纪律兜底（WK-S4）与 ADR-010 非阻塞/不进门禁旁路语义**一字不变**。
+
 摄取动作本体（四步 · 不变）：
 
 ```
