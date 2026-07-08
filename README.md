@@ -74,6 +74,22 @@ export HARNESS_AUTO_BOOTSTRAP=0        # 环境变量逃生阀
 
 从旧版（哨兵落全局）升级的项目，因哨兵落点改为项目本地，**首次会话可能重跑一次 bootstrap**。这是一次性迁移副作用，幂等无害（已装好的引擎 / 索引 / wiki 骨架各步骤会自动跳过）。
 
+### 坑④ · wiki 自动摄取直接提交到当前分支致 main 漂移
+
+v0.7.4 起，Stop hook（`session_stop_wiki_autoingest.sh`）在会话结束时后台跑 B2 自动摄取：检测 `wiki/` 源文档 delta → **每批直接 `git commit` 到当前分支、从不 push**。若在一个长期存活的 `main` 检出上反复触发，会不断把摄取批次堆到本地 main（`ahead N`），而 origin/main 又被并行推进 → 本地 main 既膨胀又落后；多个检出对同一批源卡各摄一遍还会产生重复内容。
+
+该 hook 有 opt-in 安全阀（默认关）：仅当 `WIKI_ENGINE_AUTO_INGEST=1` 才摄取。若你把它设在**受追踪的** `.claude/settings.json`（全检出可见），main 检出也会一起摄取。
+
+想要「**main 只做同步、不摄取；分支流程内照常摄取**」，在 **main 检出**建一个 gitignored 的 `.claude/settings.local.json` 覆盖开关（local 优先级高于 settings.json，且不传播到 worktree 分支）：
+
+```json
+{ "env": { "WIKI_ENGINE_AUTO_INGEST": "0" } }
+```
+
+- Stop hook 用 `git rev-parse --show-toplevel` 自定位到运行所在的检出，故按检出隔离——该覆盖只关 main、不影响分支。
+- settings env 在**会话启动时**载入：改后**下个会话起生效**，当前会话结束可能再摄一批。
+- 已漂移的 main 用 `git reset --hard origin/main` 拉回即可（被丢弃的提交仍可经 reflog 找回）。
+
 ## 插件升级后 · 脚手架怎么更新
 
 升级插件后（`/plugin marketplace update cc-harness-works` + `/reload-plugins`），**大部分脚手架会自动更新**：hooks / commands / workflows / skills / agents / rules 在下个会话由 drift-sync 从新版插件缓存**单向刷新**（你本地改过的镜像文件会被识别为定制、告警跳过、**绝不覆盖你的改动**）。所以规则 / 流程 / 工作流类的修复，升级 + 重载后即自动生效，无需手工干预。
