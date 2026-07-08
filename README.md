@@ -2,6 +2,20 @@
 
 Harness 全生命周期方法论的 Claude Code 插件市场：一套栈无关的 10 阶段 K 流程 + 元流程 M0–M5 骨架，外加可选的栈 profile（Python / React+Vite）。
 
+## Portable 文档
+
+仓库内新增一套可离线分发的 Harness portable handbook，放在 [`docs/portable-handbook-20260708/`](docs/portable-handbook-20260708/)。
+
+这 25 篇文章来自项目 wiki 与实践沉淀，但正文已经改写为自足版本：不依赖 wiki 链接即可理解概念、流程、角色、质量门禁、运行时集成与分发维护方式。适合随插件市场、培训材料、项目初始化包或离线文档站一起使用。
+
+| 范围 | 内容 |
+|---|---|
+| 00–04 入门与主流程 | [阅读路线与术语地图](docs/portable-handbook-20260708/00-阅读路线与术语地图.md)、[Harness 是什么与适用场景](docs/portable-handbook-20260708/01-Harness是什么与适用场景.md)、[项目制品与路径语境](docs/portable-handbook-20260708/02-项目制品与路径语境.md)、[最小工作流](docs/portable-handbook-20260708/03-最小工作流-从一次请求到一张变更卡.md)、[十阶段主流程](docs/portable-handbook-20260708/04-十阶段主流程.md) |
+| 05–09 编排机制 | [Application Owner 与角色编排](docs/portable-handbook-20260708/05-Application-Owner与角色编排.md)、[子 Agent 委派与防漂移纪律](docs/portable-handbook-20260708/06-子Agent委派与防漂移纪律.md)、[Rules 体系与常驻约束](docs/portable-handbook-20260708/07-Rules体系与常驻约束.md)、[Skills 体系与阶段触发](docs/portable-handbook-20260708/08-Skills体系与阶段触发.md)、[变更卡与持久化记忆](docs/portable-handbook-20260708/09-变更卡与持久化记忆.md) |
+| 10–14 元流程 | [元流程总览 M0 到 M5](docs/portable-handbook-20260708/10-元流程总览-M0到M5.md)、[M0-M2 愿景需求范围](docs/portable-handbook-20260708/11-M0-M2-愿景需求范围.md)、[M3 架构接口 ADR 与定制规则](docs/portable-handbook-20260708/12-M3-架构接口ADR与定制规则.md)、[M4-M5 工程基线与 Roadmap](docs/portable-handbook-20260708/13-M4-M5-工程基线与Roadmap.md)、[双轨启动与模式 E 级联评估](docs/portable-handbook-20260708/14-双轨启动与模式E级联评估.md) |
+| 15–19 知识层与旁路 | [知识层总览](docs/portable-handbook-20260708/15-知识层总览-wiki-codegraph-M05.md)、[wiki-engine 与 wiki-query 使用纪律](docs/portable-handbook-20260708/16-wiki-engine与wiki-query使用纪律.md)、[wiki 摄取、新鲜度、信任边界与采纳度重构](docs/portable-handbook-20260708/17-wiki摄取新鲜度信任边界与采纳度重构.md)、[codegraph 使用边界与查询路由](docs/portable-handbook-20260708/18-codegraph使用边界与查询路由.md)、[L 旁路通道与旁路证据哲学](docs/portable-handbook-20260708/19-L旁路通道与旁路证据哲学.md) |
+| 20–24 质量、运行时、分发与维护 | [质量门禁证据体系与行为验收](docs/portable-handbook-20260708/20-质量门禁证据体系与行为验收.md)、[测试守护、契约测试与假绿治理](docs/portable-handbook-20260708/21-测试守护契约测试与假绿治理.md)、[Claude Code 桥接、hooks 与运行时集成](docs/portable-handbook-20260708/22-ClaudeCode桥接hooks与运行时集成.md)、[插件化分发、模板导出与可移植性](docs/portable-handbook-20260708/23-插件化分发模板导出与可移植性.md)、[决策史、失败案例、近期 ADR 与维护手册](docs/portable-handbook-20260708/24-决策史失败案例近期ADR与维护手册.md) |
+
 ## 安装
 
 ```
