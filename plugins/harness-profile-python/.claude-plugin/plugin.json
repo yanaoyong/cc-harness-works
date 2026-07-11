@@ -1,6 +1,6 @@
 {
   "name": "harness-profile-python",
-  "version": "0.7.4",
+  "version": "0.7.5",
   "description": "Harness Python 栈 profile：FastAPI/pytest/ruff 编码·评审·测试细节 skill + 栈绑定层（pytest 等价测试命令 + 输出解析器 + 后端 8 分层 Spec 映射）。反向单向依赖 harness-core。RM-141 落地：py skill 文件已物理迁移进本 plugin 目录。",
   "author": {
     "name": "myharness"
@@ -18,7 +18,7 @@
   "dependencies": [
     {
       "name": "harness-core",
-      "version": "~0.7.4"
+      "version": "~0.7.5"
     }
   ],
   "requiredCommands": ["python3", "ruff"]
