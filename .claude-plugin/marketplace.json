@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "Harness 全生命周期方法论插件市场：harness-core（栈无关 10 阶段 + 元流程 M0-M5 骨架）+ 栈 profile（python / react-vite）。",
-    "version": "0.7.5"
+    "version": "0.7.6"
   },
   "plugins": [
     {
