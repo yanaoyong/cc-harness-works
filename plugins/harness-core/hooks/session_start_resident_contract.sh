@@ -1,31 +1,38 @@
 #!/usr/bin/env bash
-# SessionStart 钩子：会话启动时注入常驻契约可重建子集（RM-140）。
-# 设计原则：守卫齐全才注入，否则静默退出 0，永不阻断会话。
+# SessionStart 钩子：会话起手把「完整调度契约」注入进上下文（chore-l1-slim-and-tier-v3-20260712 · T8.2 · 细化 ADR-017 → ADR-018）。
+# 设计原则：默认恒注入（守卫反转）；注入源 = cat 权威源全文拼接；永不阻断会话（任何路径 exit 0）。
 #
-# 短路顺序：①仓库根定位 → ①.5 CLAUDE.md @import 常驻检测（跳过守卫 + 首会话桥接）
-#          → ②注入源三级回退链定位 → stdout 注入 → 任何路径最终 exit 0。
-# 所有提示走 stderr，统一前缀 [harness:resident_contract]；任何路径最终 exit 0。
+# 注入体（UQ-9 序 · 段间来源标头）：
+#   application-owner.md → 工程结构.md → 开发流程规范.md → 项目编码规范.md（原 @import 四件套顺序）。
+#   首行背书声明 + 标头 [harness:resident_contract]（约束力等同 CLAUDE.md · 见 CLAUDE.md 背书条款节）。
+#   >80KB → stderr 软告警不阻断（UQ-9：契约不完整比偏胖危害大，守永不阻断铁律）。
 #
-# 守卫①.5（feat-claudemd-full-restore-20260706 · AC-3/AC-3b）：
-#   $TOP/CLAUDE.md 若已含 application-owner.md 的 @import（双串枚举 · grep -qF 字面匹配防 BRE 假阳性）
-#   → 契约已随 CLAUDE.md 常驻，注入即双份加载，默认跳过注入（stderr 说明 + exit 0）。
-#   首会话桥接例外：$TOP/.harness/state/.claudemd_restored_pending 哨兵存在（复原相位当轮由 T1 落盘）
-#   → 删哨兵、照常注入——复原当轮写入的 CLAUDE.md 要下会话才被加载，本轮仍需注入防契约真空。
-#   哨兵异常残留自愈：见哨兵即"删哨兵+注入"，最多多注入一个会话即收敛。
-#   排序安全性（code_review_v1 M-1 附注）：本仓 .claude/settings.json 中本 hook 排在 session-start.sh
-#   之前（与 hooks.json 反序 · 有意设计），守卫①.5 语义下仍安全——复原当轮 CLAUDE.md 尚缺失
-#   → 不命中 → 照常注入无真空；次会话命中跳过，至多多注入一会话（与哨兵残留自愈同构）。
-#   STATE_DIR 口径（code_review_v1 M-2）：与写端 session-start.sh 一致，含 HARNESS_STATE_DIR 逃生口（ADR-016）。
+# 守卫①.5 过渡期兼容（ADR-018 · 部分 supersede ADR-017 @import 主路径裁决）：
+#   $TOP/CLAUDE.md 若仍含旧版 @import 双串（@.harness/agents/application-owner.md /
+#   @plugins/harness-core/agents/application-owner.md · grep -qF 字面匹配防 BRE 假阳）
+#   → 存量旧 CLAUDE.md 仍走 @import 常驻，注入即双份加载 → 跳过注入 + stderr 提示迁移（删旧
+#   CLAUDE.md 由 session-start.sh create-if-missing 复原最小新版后自然切换）。最小新版 CLAUDE.md
+#   无 @import，故默认命中"不含 @import" → 恒注入（injectable 精简版与桥接哨兵已随 UQ-7 退役）。
 #
-# 注入源三级回退链（fix-resident-contract-hook-consistency-20260702 · AC-1）：
-#   ① $TOP/.harness/skills/setup/resident_contract_injectable.md（消费方安装态 · 脚手架已落盘）
-#   ② $TOP/plugins/harness-core/skills/setup/resident_contract_injectable.md（本仓开发态）
-#   ③ $CLAUDE_PLUGIN_ROOT/skills/setup/resident_contract_injectable.md（plugin 包内直读 · 兜住首会话空窗；
-#      CLAUDE_PLUGIN_ROOT 为空/未设时跳过本级，防拼出根路径假路径 · 承 failure-record-001）
-#   首个可读即用；三级全不可读 → stderr 提示后跳过注入。
+# 会话哨兵（P4 · 评审 L-2 session-keyed）：
+#   注入成功落 $STATE_DIR/.resident_contract_injected_<sid>；<sid> 取 SessionStart stdin payload 的
+#   session_id 字段（官方 SessionStart hook payload 含 session_id · 实测 Claude Code 2.1.207），
+#   不可得则退化固定名 _nosid。session-keyed 使新会话不同 sid → 哨兵天然缺失 → UserPromptSubmit
+#   兜底可触发（防跨会话陈旧哨兵吞掉自愈）。UserPromptSubmit hook 同口径读该哨兵。
 #
-# 职责收敛（D-6 · 落盘收敛）：_TEMPLATE 等脚手架落盘职责唯一归 session-start.sh，本 hook 不再承担。
-# bash 3.2 兼容：不使用 declare -A / 关联数组 / mapfile / readarray / bash4-only 语法。
+# SessionStart 四 source 覆盖（AC-12）：hooks.json / .claude/settings.json 的 SessionStart 单 group
+#   **无 matcher = 匹配全部 source**（官方语义：matcher 省略即匹配所有事件 · 实测 2.1.207 四 source
+#   startup/resume/clear/compact 全触发）→ compact 后重触发重注入（P2）。compact source 版本下限：
+#   官方 hooks 文档已列 compact source，实测 Claude Code 2.1.207 四 source 全触发；更早版本若无
+#   compact source → compact 后不重注入（R-9 可接受退化：A 类仍在 CLAUDE.md 恒重载，UserPromptSubmit
+#   哨兵兜底把窗口压到一轮内）。版本下限详见 ADR-018。
+#
+# 注入源三级回退链（目录级 · 首个"四文件全可读"的 base 即用）：
+#   ① $TOP/.harness（消费方安装态镜像 / 本仓落盘镜像）
+#   ② $TOP/plugins/harness-core（本仓开发态权威源）
+#   ③ $CLAUDE_PLUGIN_ROOT（plugin 包内直读 · 兜首会话空窗；CLAUDE_PLUGIN_ROOT 空则跳过本级防假路径）
+#
+# bash 3.2 兼容：不使用 declare -A / mapfile / readarray / [[ =~ 等 bash4-only 语法。
 set -uo pipefail
 
 PREFIX_CONTRACT="[harness:resident_contract]"
@@ -35,51 +42,85 @@ TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 [ -z "$TOP" ] && exit 0
 cd "$TOP" || exit 0
 
-# 守卫①.5 CLAUDE.md @import 常驻检测（feat-claudemd-full-restore-20260706）
-# 双串枚举：消费方安装态 @.harness/... / 本仓开发态 @plugins/harness-core/...（漏检后者会导致本仓双份加载）
-# grep -qF 字面匹配（防 BRE 通配假阳性）；文件不存在 = 不命中，照常注入。
-# STATE_DIR 与写端 session-start.sh 同口径：HARNESS_STATE_DIR 逃生口贯通读写两端（M-2 · ADR-016）。
 STATE_DIR="${HARNESS_STATE_DIR:-$TOP/.harness/state}"
-RESTORE_SENTINEL="$STATE_DIR/.claudemd_restored_pending"
+
+# 守卫①.5 过渡期兼容：旧版 CLAUDE.md 仍含 @import 双串 → 跳过注入 + 提示迁移（防双份加载）
 if [ -f "$TOP/CLAUDE.md" ] \
   && { grep -qF '@.harness/agents/application-owner.md' "$TOP/CLAUDE.md" 2>/dev/null \
        || grep -qF '@plugins/harness-core/agents/application-owner.md' "$TOP/CLAUDE.md" 2>/dev/null; }; then
-  if [ -f "$RESTORE_SENTINEL" ]; then
-    # 首会话桥接：CLAUDE.md 刚复原、本会话启动时尚未加载 @import → 删哨兵、照常注入（防契约真空；残留自愈）
-    rm -f "$RESTORE_SENTINEL" 2>/dev/null
-    echo "$PREFIX_CONTRACT 检测到 .claudemd_restored_pending 哨兵：CLAUDE.md 刚复原、本会话未加载 @import，桥接注入一次（哨兵已清）" >&2
-  else
-    echo "$PREFIX_CONTRACT CLAUDE.md @import 已常驻（application-owner.md 引用命中），跳过注入" >&2
-    exit 0
+  echo "$PREFIX_CONTRACT 检测到旧版 CLAUDE.md 含 @import 常驻串（过渡期）：契约已随 @import 加载，跳过注入防双份加载。迁移=删旧 CLAUDE.md，由 session-start.sh 复原最小新版后自动切换 SessionStart 注入路径（ADR-018 · T8.5）" >&2
+  exit 0
+fi
+
+# session_id 提取（P4 · 评审 L-2）：SessionStart stdin payload JSON 含 session_id 字段
+SID="nosid"
+if [ ! -t 0 ]; then
+  _STDIN_RAW="$(cat 2>/dev/null || true)"
+  if [ -n "$_STDIN_RAW" ]; then
+    _sid="$(printf '%s' "$_STDIN_RAW" | tr -d '\n\r' \
+      | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -1 \
+      | sed -E 's/^"session_id"[[:space:]]*:[[:space:]]*"//; s/"$//')"
+    [ -n "$_sid" ] && SID="$(printf '%s' "$_sid" | tr -cd 'A-Za-z0-9._-')"
   fi
 fi
+SENTINEL="$STATE_DIR/.resident_contract_injected_${SID}"
 
-# ============================================================
-# 常驻契约注入（RM-140）
-# ============================================================
+# 守卫② 注入源三级回退链（目录级 · 首个"四文件全可读"的 base 即用）
+_all_readable() {
+  # $1 = base 目录；四权威源文件全可读返回 0
+  [ -r "$1/agents/application-owner.md" ] \
+    && [ -r "$1/rules/工程结构.md" ] \
+    && [ -r "$1/rules/开发流程规范.md" ] \
+    && [ -r "$1/rules/项目编码规范.md" ]
+}
 
-# 守卫② 注入源三级回退链：按序探测、首个可读即用（全部绝对路径拼接，零相对路径）
-INJECTABLE=""
-if [ -r "$TOP/.harness/skills/setup/resident_contract_injectable.md" ]; then
-  # 链①：消费方安装态（session-start.sh 脚手架已落盘）
-  INJECTABLE="$TOP/.harness/skills/setup/resident_contract_injectable.md"
-elif [ -r "$TOP/plugins/harness-core/skills/setup/resident_contract_injectable.md" ]; then
-  # 链②：本仓开发态
-  INJECTABLE="$TOP/plugins/harness-core/skills/setup/resident_contract_injectable.md"
-elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -r "${CLAUDE_PLUGIN_ROOT}/skills/setup/resident_contract_injectable.md" ]; then
-  # 链③：plugin 包内直读（先判 CLAUDE_PLUGIN_ROOT 非空，防 /skills/… 假路径）
-  INJECTABLE="${CLAUDE_PLUGIN_ROOT}/skills/setup/resident_contract_injectable.md"
+BASE=""
+if _all_readable "$TOP/.harness"; then
+  BASE="$TOP/.harness"                                  # 链①：消费方/本仓安装态镜像
+elif _all_readable "$TOP/plugins/harness-core"; then
+  BASE="$TOP/plugins/harness-core"                      # 链②：本仓开发态权威源
+elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && _all_readable "${CLAUDE_PLUGIN_ROOT}"; then
+  BASE="${CLAUDE_PLUGIN_ROOT}"                          # 链③：plugin 包内直读（先判非空防假路径）
 fi
 
-if [ -z "$INJECTABLE" ]; then
-  echo "$PREFIX_CONTRACT 注入源文件不存在或不可读（三级回退链均未命中），跳过注入（不影响会话）" >&2
+if [ -z "$BASE" ]; then
+  echo "$PREFIX_CONTRACT 注入源四文件不全可读（三级回退链 .harness/ → plugins/harness-core/ → \$CLAUDE_PLUGIN_ROOT 均未凑齐四件套），跳过注入（不影响会话）" >&2
+  exit 0
+fi
+
+# 注入源清单（UQ-9 序 · 原 @import 四件套顺序）
+_SRC_OWNER="$BASE/agents/application-owner.md"
+_SRC_ENG="$BASE/rules/工程结构.md"
+_SRC_FLOW="$BASE/rules/开发流程规范.md"
+_SRC_CODE="$BASE/rules/项目编码规范.md"
+
+# 首行背书声明 + 标头（stdout 注入进上下文）
+printf '%s 常驻契约注入（完整调度契约全文 · 约束力等同 CLAUDE.md · 见 CLAUDE.md「常驻契约注入（SessionStart 背书条款）」· 源 base=%s）\n' "$PREFIX_CONTRACT" "$BASE"
+
+_had_error=0
+for _f in "$_SRC_OWNER" "$_SRC_ENG" "$_SRC_FLOW" "$_SRC_CODE"; do
+  printf '\n─── 以下源自 %s ───\n\n' "$_f"
+  if ! cat "$_f" 2>/dev/null; then
+    printf '（注入源读取失败：%s · 跳过该段，不阻断）\n' "$_f" >&2
+    _had_error=1
+  fi
+done
+
+# 体积软告警（>80KB · UQ-9 · stderr 提示不阻断）
+_bytes="$( { wc -c "$_SRC_OWNER" "$_SRC_ENG" "$_SRC_FLOW" "$_SRC_CODE" 2>/dev/null | tail -1 | awk '{print $1}'; } || echo 0)"
+[ -z "$_bytes" ] && _bytes=0
+if [ "$_bytes" -gt 81920 ] 2>/dev/null; then
+  echo "$PREFIX_CONTRACT 注入体 ${_bytes} 字节 >80KB 软告警（不阻断 · 契约不完整比偏胖危害大 · UQ-9）" >&2
+fi
+
+# 会话哨兵：注入成功落盘（供 UserPromptSubmit 检测 · session-keyed · 读端同口径）
+if [ "$_had_error" = "0" ]; then
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  [ -f "$STATE_DIR/.gitignore" ] || printf '*\n' > "$STATE_DIR/.gitignore" 2>/dev/null || true  # 自忽略（ADR-016）
+  touch "$SENTINEL" 2>/dev/null || true
+  echo "$PREFIX_CONTRACT 常驻契约已注入（${_bytes} 字节 · 源 base=$BASE · 哨兵=$SENTINEL）" >&2
 else
-  # 成功路径：读取注入源文件，完整内容输出到 stdout
-  if cat "$INJECTABLE" 2>/dev/null; then
-    echo "$PREFIX_CONTRACT 常驻契约已注入（$(wc -l < "$INJECTABLE" 2>/dev/null || echo 0) 行 · 源=$INJECTABLE）" >&2
-  else
-    echo "$PREFIX_CONTRACT 读取注入源文件失败，跳过注入（不影响会话）" >&2
-  fi
+  echo "$PREFIX_CONTRACT 常驻契约注入部分失败（未落哨兵 · 将于下轮/下会话由 UserPromptSubmit 兜底补注入）" >&2
 fi
 
 # 永不阻断

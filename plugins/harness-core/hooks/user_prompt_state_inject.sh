@@ -405,6 +405,48 @@ emit_wiki_nudge() {
   return 0
 }
 
+# ---------- 常驻契约会话哨兵检测 + 兜底补注入（chore-l1-slim-and-tier-v3-20260712 · T8.3 · P4）----------
+# SessionStart 的 session_start_resident_contract.sh 注入成功落 session-keyed 哨兵；本 hook 每轮检测，
+# 缺失 → prompt_state 报警 + 兜底补注入（cat 权威源全文一次 · 与主注入同源 · UQ-7）+ 落哨兵防每轮重复。
+# 恒不改退出码路径（永不阻断）。注入源三级回退链与主注入同口径（目录级 · 首个"四文件全可读"即用）。
+
+_upi_contract_all_readable() {
+  [ -r "$1/agents/application-owner.md" ] \
+    && [ -r "$1/rules/工程结构.md" ] \
+    && [ -r "$1/rules/开发流程规范.md" ] \
+    && [ -r "$1/rules/项目编码规范.md" ]
+}
+
+_upi_locate_contract_base() {
+  # $1=root ; 三级回退链 .harness/ → plugins/harness-core/ → $CLAUDE_PLUGIN_ROOT，首个四文件全可读即用
+  local top="$1"
+  if _upi_contract_all_readable "$top/.harness"; then printf '%s' "$top/.harness"; return 0; fi
+  if _upi_contract_all_readable "$top/plugins/harness-core"; then printf '%s' "$top/plugins/harness-core"; return 0; fi
+  if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && _upi_contract_all_readable "${CLAUDE_PLUGIN_ROOT}"; then
+    printf '%s' "${CLAUDE_PLUGIN_ROOT}"; return 0
+  fi
+  return 1
+}
+
+emit_contract_fallback() {
+  # $1=root $2=sentinel_path ; cat 权威源全文一次（UQ-9 序）+ 落哨兵防重复
+  local root="$1" sentinel="$2" base f
+  base="$(_upi_locate_contract_base "$root" || true)"
+  if [ -z "$base" ]; then
+    printf '%s\n' "  ⚠️ [harness:resident_contract] 兜底注入源四文件不全可读（三级回退链均未凑齐），跳过兜底（A 类契约仍在 CLAUDE.md 恒重载 · 非契约真空）"
+    return 0
+  fi
+  printf '%s\n' ""
+  printf '%s 会话哨兵缺失 → UserPromptSubmit 兜底补注入完整调度契约（一次性·非每轮 · 约束力等同 CLAUDE.md · 源 base=%s）：\n' "[harness:resident_contract]" "$base"
+  for f in "$base/agents/application-owner.md" "$base/rules/工程结构.md" "$base/rules/开发流程规范.md" "$base/rules/项目编码规范.md"; do
+    printf '\n─── 以下源自 %s ───\n\n' "$f"
+    cat "$f" 2>/dev/null || printf '（读取失败：%s）\n' "$f"
+  done
+  mkdir -p "$(dirname "$sentinel")" 2>/dev/null || true
+  [ -f "$(dirname "$sentinel")/.gitignore" ] || printf '*\n' > "$(dirname "$sentinel")/.gitignore" 2>/dev/null || true
+  touch "$sentinel" 2>/dev/null || true
+}
+
 # ---------- G-1 双注入守卫（spec §3 T1 · 缓解 R3 双注册点同时生效）----------
 
 _g1_should_yield() {
@@ -456,8 +498,22 @@ main() {
     l_handle_prompt "$prompt_val" || true
   fi
 
+  # 常驻契约会话哨兵检测（T8.3 · P4）：session-keyed（session_id 自 stdin payload · 与写端同口径）
+  local _state_dir="${HARNESS_STATE_DIR:-$root/.harness/state}" _sid="nosid" _upi_sid _sentinel _contract_missing=0
+  if [ -n "$stdin_raw" ]; then
+    _upi_sid="$(printf '%s' "$stdin_raw" | tr -d '\n\r' \
+      | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -1 \
+      | sed -E 's/^"session_id"[[:space:]]*:[[:space:]]*"//; s/"$//')"
+    [ -n "$_upi_sid" ] && _sid="$(printf '%s' "$_upi_sid" | tr -cd 'A-Za-z0-9._-')"
+  fi
+  _sentinel="$_state_dir/.resident_contract_injected_${_sid}"
+  [ -f "$_sentinel" ] || _contract_missing=1
+
   emit_header
   printf '%s\n' "  仓库根：$root"
+  if [ "$_contract_missing" = "1" ]; then
+    printf '%s\n' "  ⚠️ [harness:resident_contract] 会话哨兵缺失（SessionStart 注入未生效/被压缩）→ 本轮兜底补注入完整调度契约（附于块末·一次性）。A 类决策契约仍在 CLAUDE.md 恒重载。"
+  fi
   printf '\n'
 
   if [ ! -d "$changes_dir" ]; then
@@ -473,6 +529,10 @@ main() {
   emit_actions
   printf '\n'
   emit_wiki_nudge
+  # 兜底补注入置于块末（哨兵缺失时 · 一次性落哨兵防每轮重复）
+  if [ "$_contract_missing" = "1" ]; then
+    emit_contract_fallback "$root" "$_sentinel"
+  fi
   exit 0
 }
 
