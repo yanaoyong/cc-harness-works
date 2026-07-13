@@ -27,6 +27,10 @@ stack: vendor-neutral（具体栈见 HARNESS_CONFIG.yaml）
 
 ## 4. 步骤（SOP）
 
+> **起手批量并发首读（proposal-012 §3② · 一条消息并发）**：进入阶段3 第一动作 = 把以下独立首读项在**一条消息内并发**读取——`spec.md` + `tasks.md` + `../../rules/项目编码规范.md` + `../../rules/工程结构.md`；分层 Spec 与既有代码按当前所处层随后按需加载。
+>
+> **减肥刀法（proposal-012 §3⑤ · 压早期高复利沉积）**：① **编码前摸底外包**——优先派 Explore 子 Agent 或 `cg explore`、主循环只收摘要（**codegraph 未接入时降级为 Explore 子 Agent**）；② **Read 定点化**——用 `offset`/`limit` 或 `cg node` 读符号/片段，**不整文件 Read**；③ **内联脚本落盘复用**——heredoc 长脚本首跑即写 scratchpad 文件、后续只调路径，不在回合间反复内联重贴。
+
 1. 阅读 spec/tasks，确认改动范围与分层归属（对照 `工程结构.md` §2.1）。
 2. **逐层实现**：按 `layeredSpecMapping()` 返回的 `SpecLayer[]` 顺序逐层实现（本项目实值 = `coding-skill/specs/` 8 份后端分层 Spec · 分层顺序与语义见 `../../rules/工程结构.md` §2.1 ES）。
 3. 全程遵守硬约束（见 `项目编码规范.md` §0 / §2 通用层 GEN）：

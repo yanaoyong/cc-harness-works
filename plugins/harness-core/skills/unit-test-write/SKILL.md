@@ -27,6 +27,10 @@ stack: vendor-neutral（具体栈见 HARNESS_CONFIG.yaml）
 
 ## 4. 步骤（SOP）
 
+> **起手批量并发首读（proposal-012 §3② · 一条消息并发）**：进入阶段5 第一动作 = 把以下独立首读项在**一条消息内并发**读取——`coding/coding_report_vN.md` + `coding/review/code_review_vN.md` + `git diff --stat` + `../../rules/项目编码规范.md`（§3 PY-4 测试根/约定）。
+>
+> **减肥刀法 · 脚本落盘复用（proposal-012 §3⑤）**：造数/驱动用的 heredoc 长脚本首跑即写入 scratchpad 文件、后续只调路径，不在写→跑→改回合间反复内联重贴。
+
 1. **改动驱动**：改了哪个表现/业务层方法就测哪个，而非只测无关模块。
 2. 使用栈特定层约定的**测试客户端 / 测试夹具**（栈特定见 `../../rules/项目编码规范.md §3 PY-4`）。
 3. 覆盖正常路径 + 关键边界/异常路径。

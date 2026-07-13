@@ -25,6 +25,9 @@ spec: docs/stage-01-Harness体系建设/02-体系设计/06-Skills技能体系规
 - 相关 Rules（作为评审依据）。
 
 ## 4. 步骤（SOP）
+
+> **起手批量并发首读（proposal-012 §3② · 一条消息并发 · 按评审类型枚举）**：确定类型后，把该阶段独立首读项在**一条消息内并发**读取——**阶段2 计划评审** = `spec.md` + `tasks.md`；**阶段4 执行评审** = `spec.md` + `coding/coding_report_vN.md` + `git diff --stat`；**阶段6 单测评审** = 两份报告并发（`unit_test/unit_test_report_vN.md` + `coding/coding_report_vN.md`）+ `git diff --stat`。
+
 1. 确定评审类型（计划 / 执行 / 单测）。
 2. 对照 Rules 与需求逐项检查（分层依赖、硬约束、覆盖面等）。
 3. 形成意见，**每条意见格式 = 问题描述 + 修改建议 + 优先级（MUST FIX / LOW / INFO）**。
