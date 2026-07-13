@@ -155,6 +155,8 @@ spec: docs/stage-01-Harness体系建设/02-体系设计/04-编排中枢-Applicat
 
 **P0 · 阶段 7/8/9 默认委派纪律（堵 inline 逃逸口 · 来源 `proposal-011` §6）**：阶段 7/8/9 的**默认动作 = 委派 haiku 子 Agent 执行**——不再只是「委派子 Agent 时默认传 `model: haiku` 参数」（proposal-011 五卡实测这三阶段 haiku output=0，病根是 Owner 在阶段 7–10 结构性 **inline 亲自执行**、绕过了「委派时才传参」的绑定，形成逃逸口）。据此升格：这三个阶段**默认应当委派** haiku 子 Agent 执行；Owner **inline 亲自执行 = 逃逸例外**，须在 `summary.md` 该阶段记录行写一句理由（格式 `owner·inline·<理由>`，与下方 R4 硬格式衔接）。**逃生口不收窄（R-风1）**：本纪律**不与 R2 冲突**——Owner 按风险预判上调（inline 或委派 sonnet/opus · 见 R2 白名单）留一句理由即合规、**不设审批**；「默认应当委派 haiku」只是默认最低档，Owner 的按风险上调判断权不受影响。
 
+> **P0 增补（`feat-stage-exec-scripts-20260712` · proposal-012 §3④ · 与下方 R4 `owner·script·` 类别衔接）**：**阶段 7/8 自本卡起，默认动作改为走 `.harness/scripts/` 下的执行脚本**（`stage7_push.sh` / `stage8_ci.sh`）——这是**合法的非委派执行**（机械链路搬进纯 shell 载体，判定权仍归冻结判定式 · ADR-005 语义不变），记录行标 `owner·script·<脚本名>`，**不是** P0 要堵的 inline 逃逸。**阶段 9 无对应脚本，默认仍为委派 haiku 子 Agent**（inline 亲自执行仍属逃逸例外，须留 `owner·inline·<理由>`）。**不得外推**：「走脚本 = 合法非委派」只对**有脚本可走**的阶段 7/8 成立；Owner 亲自逐条手敲命令**不因本增补而变成 script**，仍须标 `owner·inline·<理由>`（详见下方 R4 后「`owner·script·` 与 `owner·inline·` 的区别」段）。
+
 **降档安全阀（R1–R4 · 与默认档配套，完整条文）**：
 
 **R1 · 失败升档梯子**：**低于 Opus 的默认档委派**（阶段 7/8/9 haiku、阶段 5 sonnet）若出现——(a) 门禁未过且根因疑似**模型执行质量**（报告填错 / 命令误用 / 漏步骤）；(b) 回报含**损坏残片或可疑数字**（对照上方「委派操作教训」第 2 条）——→ **同任务重委派升一档：haiku→sonnet→opus、sonnet→opus；不做同档二次重试（含不做第二次 haiku 重试）；opus 仍失败 → 升级人工**（与评审循环上限的升级语义对齐）。边界：**真实测试红（代码本身问题）不算降档失败**，走 DF-003 既有回退路由，与模型档无关。
@@ -166,7 +168,9 @@ spec: docs/stage-01-Harness体系建设/02-体系设计/04-编排中枢-Applicat
 - 降档**不改变门禁正确性**：判定阈值由脚本/退出码给出，**Owner 仍独立核验门禁结果**（验收基于可验证证据，见模块三职责4 / 模块五）→ 降档错填会被核验逮住，**不产生假绿穿透**。
 - 边界：阶段 9 **部署参数禁止推测**（模块五「禁止推测部署参数」/ 开发流程规范 DF-007），HITL-4 部署参数人判不受模型档位影响。
 
-**R4 · 留痕观测（硬格式 · P1b 升格 · 来源 `proposal-011` §6）**：`summary.md` **阶段记录行必须带「执行方·档位」标注**——由原「记录该阶段实际使用的模型档」升格为硬格式（proposal-011 五卡实测 R4 留痕基本未执行、审计只能翻 transcript，故硬格式化使执行率可 grep 审计）。**格式样例**：`generator·sonnet` / `reviewer·opus` / `reviewer·sonnet` / `owner·inline·<一句理由>`（阶段 7/8/9 Owner inline 亲自执行时的理由即以 `owner·inline·<理由>` 承载，与上方 P0 纪律衔接）。**判据：漏标 = R4 不合规**（summary 阶段记录行 grep 可证执行率，对照 p010「分档纸面化一个月」病灶）。**适用面**：本硬格式**仅 10 阶段卡阶段记录行先行**（OQ-4 决议——proposal-011 审计对象即 10 阶段卡）；元流程 M 阶段记录行留后续卡，暂不受本硬格式约束。
+**R4 · 留痕观测（硬格式 · P1b 升格 · 来源 `proposal-011` §6）**：`summary.md` **阶段记录行必须带「执行方·档位」标注**——由原「记录该阶段实际使用的模型档」升格为硬格式（proposal-011 五卡实测 R4 留痕基本未执行、审计只能翻 transcript，故硬格式化使执行率可 grep 审计）。**格式样例**：`generator·sonnet` / `reviewer·opus` / `reviewer·sonnet` / `owner·inline·<一句理由>` / `owner·script·<脚本名>`（阶段 7/8/9 Owner inline 亲自执行时的理由即以 `owner·inline·<理由>` 承载，与上方 P0 纪律衔接）。**判据：漏标 = R4 不合规**（summary 阶段记录行 grep 可证执行率，对照 p010「分档纸面化一个月」病灶）。**适用面**：本硬格式**仅 10 阶段卡阶段记录行先行**（OQ-4 决议——proposal-011 审计对象即 10 阶段卡）；元流程 M 阶段记录行留后续卡，暂不受本硬格式约束。
+
+**`owner·script·<脚本名>` 与 `owner·inline·<理由>` 的区别（feat-stage-exec-scripts-20260712 · proposal-012 §3④ 新增执行方类别）**：`owner·script·<脚本名>`（如 `owner·script·stage7_push.sh` / `owner·script·stage8_ci.sh`）标注**阶段 7/8 Owner 走 `.harness/scripts/` 下的执行脚本完成本阶段**——这是**合法的非委派执行**：脚本本身是把高度机械的链路（白名单 add→commit→push→PR / testCommand→outputParser→eval_gate_contract）从模型回合搬进纯 shell 载体，判定权仍归冻结判定式（ADR-005 语义不变），不构成对 P0 纪律的规避。**`owner·inline·<理由>` 则相反**——是 Owner 在没有脚本、没有委派子 Agent 的情况下**亲自逐条手敲命令/填报告**，是 P0 纪律要堵的 inline 逃逸口（proposal-011 §6 病灶：委派应绑定却被绕过）。**判据**：阶段 7/8 若调用了 `stage7_push.sh`/`stage8_ci.sh`，记录行**必须**用 `owner·script·<脚本名>`，**不得**误标 `owner·inline`（会掩盖"已脚本化、非逃逸"的事实，污染 R4 审计口径）；阶段 9（无对应脚本）仍按原 P0 纪律走 haiku 委派或 `owner·inline·<理由>`。
 
 ### 阶段6 单测评审转正 `sonnet`（原 P1a 试点转正 · 仅阶段6 · 来源 `proposal-011` §5 + 2026-07-12 用户裁决）
 

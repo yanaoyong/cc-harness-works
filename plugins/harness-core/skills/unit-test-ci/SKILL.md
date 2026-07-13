@@ -34,6 +34,8 @@ stack: vendor-neutral（具体栈见 HARNESS_CONFIG.yaml）
 
    > 测试路径以 `spec.md` 或 Owner 指定为准；按变更影响面选择测试路径（工具链改动须含对应工具测试目录）；禁止未执行测试即填 SUCCESS。
 
+   **脚本化执行（`.harness/scripts/stage8_ci.sh` · proposal-012 §3④ · ADR-005 语义不变）**：以上「testCommand 执行 → outputParser 解析 → 冻结判定器裁决」三段串联，日常经由该脚本一条命令端到端跑通——`bash .harness/scripts/stage8_ci.sh [--card <变更目录>]`，自动读取 `HARNESS_CONFIG.yaml` 的 `test_command`、按技术栈标识**映射到对应的 outputParser**（映射表由脚本按配置解析，栈专属解析器由 profile 层提供），并把结果喂给 `eval_gate_contract.sh` 得到 `gate=PASS|FAIL`，同时生成本步骤 2/3 所需的 `ci_result.md` 机械段。脚本只是执行载体，不复制/不旁路判定式；红路归因仍留 Owner 人工填写。**看结果的纪律：用解析器管道看结果、不看裸测试输出全文**——消费脚本 stderr 打印的 `status=`/`total_tests=`/`passed=`/`gate=` 结构化行与 `ci_result.md` 机械段即可判断门禁结论，仅 `gate=FAIL` 时才需要查看脚本输出的 exact 失败用例清单定位问题，不要求通读原始测试输出全文（噪声大、token 贵）。
+
 2. **采集指标**（写入 `ci_result.md`）：
 
    | 字段 | 取值说明 |
