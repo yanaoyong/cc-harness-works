@@ -1,5 +1,5 @@
 {
-  "_note": "RM-141 落地 + feat-plugin-hooks-commands-migration-20260701 补齐 + fix-resident-contract-hook-consistency-20260702 修订 + feat-plugin-display-parity-20260704 增补 + feat-plugin-bootstrap-automation-20260705 追加：SessionStart(7) + UserPromptSubmit(1) + PreToolUse(2: Bash+Skill) + PostToolUse(1: Edit|Write|MultiEdit) + Stop(1) 共 12 个钩子。仅 manifest 注册，plugin 安装态生效；本仓运行时引用仍以 .claude/settings.json 为准。SessionStart 顺序假设按单 group 内层 hooks 数组序执行（D-7 finding 基此假设）：session-start（脚手架落盘）先行、session_start_resident_contract（契约注入）在后，与注入源三级回退链构成首会话双保险。三维护 hook（autosync/autoflip/wiki_freshness）注册取舍：autosync 无额外资产依赖、注册即生效；autoflip 依赖 $TOP/.harness/scripts/lib/merged_detect.sh——纯 plugin 安装态该资产未随脚手架落盘时 fail-open no-op（守卫静默 exit 0 永不阻断），注册使其就绪待命而非即时生效；wiki_freshness 已由 fix-wiki-freshness-hook-20260702 改为 wiki-rescan bin 三级回退链定位（$TOP/.harness/ 消费方安装态 → $TOP/plugins/harness-core/ 本仓开发态 → $CLAUDE_PLUGIN_ROOT/ plugin 包内直读 · 首个可读即用），本仓开发态即时生效；三级全不命中仍 fail-open 静默 exit 0 永不阻断。本 hooks.json 与本仓 .claude/settings.json 两注册点顺序独立、各自成立（plugin 安装态需脚手架先行；本仓开发态注入源回退链②恒可用故顺序无关），顺序不同为有意设计而非漂移。PostToolUse 使用 stop_progress_check.sh（非 post_edit_checks.sh——项目特定，不入 plugin）。feat-plugin-display-parity-20260704 增补：新增 UserPromptSubmit(1: user_prompt_state_inject.sh——已三级回退链改造 + G-1 双注入守卫，撤销旧'prompt_state 项目特定不入 plugin'判断，plugin 安装态可生效) + SessionStart 第 6 项 setup_statusline.sh（真实约束 = 须排 session-start.sh 之后：依赖其先把 statusline.sh 落盘 $TOP/.harness/scripts/；首会话时序 scaffold 先行，未落盘时 setup 守卫④检测两文件缺失即让位、下会话补齐）。R4 副作用留痕：display-parity 卡随 scripts/ 镜像落盘 lib/merged_detect.sh，使已注册的 session_start_autoflip 在纯 plugin 安装态由 no-op 变就绪生效（原 R-6 依赖资产补齐即该卡完成）。feat-plugin-bootstrap-automation-20260705 追加：SessionStart 第 7 项（末位）session_start_bootstrap_hint.sh（T4）：detect-only 三项就绪检测（引擎 runtime / .codegraph/ 索引 / wiki/ 目录）——三缺任一 stderr 恰一行引导 /harness-core:bootstrap、三全零输出、恒 exit 0；另承 B 路径接力（引擎已就绪+索引缺+opt-in 开关开 → 接力 cg init，唯一例外写入分支 · F-3）。末位排序依据 OQ-3 决议：沿单 group 数组序假设排 session-start.sh 之后，首会话 auto-bootstrap 完成后 detect 读到 post-bootstrap 状态不误报；与 setup_statusline 的相对次序无依赖（两者均只需在 session-start.sh 之后）。bin/cg 三级链全不命中 fail-open 静默 exit 0（F-8 · 对齐 wiki_freshness 先例），永不阻断。",
+  "_note": "RM-141 落地 + feat-plugin-hooks-commands-migration-20260701 补齐 + fix-resident-contract-hook-consistency-20260702 修订 + feat-plugin-display-parity-20260704 增补 + feat-plugin-bootstrap-automation-20260705 追加：SessionStart(7) + UserPromptSubmit(1) + PreToolUse(2: Bash+Skill) + PostToolUse(1: Edit|Write|MultiEdit) + Stop(1) 共 12 个钩子。仅 manifest 注册，plugin 安装态生效；本仓运行时引用仍以 .claude/settings.json 为准。SessionStart 顺序假设按单 group 内层 hooks 数组序执行（D-7 finding 基此假设）：session-start（脚手架落盘）先行、session_start_resident_contract（契约注入）在后，与注入源三级回退链构成首会话双保险。三维护 hook（autosync/autoflip/wiki_freshness）注册取舍：autosync 无额外资产依赖、注册即生效；autoflip 依赖 $TOP/.harness/scripts/lib/merged_detect.sh——纯 plugin 安装态该资产未随脚手架落盘时 fail-open no-op（守卫静默 exit 0 永不阻断），注册使其就绪待命而非即时生效；wiki_freshness 已由 fix-wiki-freshness-hook-20260702 改为 wiki-rescan bin 三级回退链定位（$TOP/.harness/ 消费方安装态 → $TOP/plugins/harness-core/ 本仓开发态 → $CLAUDE_PLUGIN_ROOT/ plugin 包内直读 · 首个可读即用），本仓开发态即时生效；三级全不命中仍 fail-open 静默 exit 0 永不阻断。本 hooks.json 与本仓 .claude/settings.json 两注册点顺序独立、各自成立（plugin 安装态需脚手架先行；本仓开发态注入源回退链②恒可用故顺序无关），顺序不同为有意设计而非漂移。PostToolUse 使用 stop_progress_check.sh（非 post_edit_checks.sh——项目特定，不入 plugin）。feat-plugin-display-parity-20260704 增补：新增 UserPromptSubmit(1: user_prompt_state_inject.sh——已三级回退链改造 + G-1 双注入守卫，撤销旧'prompt_state 项目特定不入 plugin'判断，plugin 安装态可生效) + SessionStart 第 6 项 setup_statusline.sh（真实约束 = 须排 session-start.sh 之后：依赖其先把 statusline.sh 落盘 $TOP/.harness/scripts/；首会话时序 scaffold 先行，未落盘时 setup 守卫④检测两文件缺失即让位、下会话补齐）。R4 副作用留痕：display-parity 卡随 scripts/ 镜像落盘 lib/merged_detect.sh，使已注册的 session_start_autoflip 在纯 plugin 安装态由 no-op 变就绪生效（原 R-6 依赖资产补齐即该卡完成）。feat-plugin-bootstrap-automation-20260705 追加：SessionStart 第 7 项（末位）session_start_bootstrap_hint.sh（T4）：detect-only 三项就绪检测（引擎 runtime / .codegraph/ 索引 / wiki/ 目录）——三缺任一 stderr 恰一行引导 /harness-core:bootstrap、三全零输出、恒 exit 0；另承 B 路径接力（引擎已就绪+索引缺+opt-in 开关开 → 接力 cg init，唯一例外写入分支 · F-3）。末位排序依据 OQ-3 决议：沿单 group 数组序假设排 session-start.sh 之后，首会话 auto-bootstrap 完成后 detect 读到 post-bootstrap 状态不误报；与 setup_statusline 的相对次序无依赖（两者均只需在 session-start.sh 之后）。bin/cg 三级链全不命中 fail-open 静默 exit 0（F-8 · 对齐 wiki_freshness 先例），永不阻断。 feat-hitl-authz-hardening-20260713 追加（DF-015）：PreToolUse 新增 2 hook——matcher='Agent|Task' → pretool_agent_delegation_guard.sh（委派 generator/reviewer/strategist 时校验 prompt 四要素 model/回合预算/白名单/严格约束，缺项 exit 2 给修复配方，放行写委派台账 $STATE_DIR/delegations_<sid>.log 供翻牌门消费；Agent=本环境委派工具名，Task=历史兼容）；matcher='Edit|Write|MultiEdit' → pretool_summary_flip_guard.sh（拦 .harness/changes/*/summary.md 阶段 1/3/5 翻 PASSED 但无同卡 generator 委派台账记录的 Owner inline 逃逸；MultiEdit 于 code_review_v1 M-1 按可用工具面之并集纳入，避免改用 MultiEdit 绕过）。两 hook 均 AC-10 三层 fail 边界：规则命中/证据类失败（台账缺失不可读）→ deny，周边失败（jq 缺失/payload 非 JSON/STATE_DIR 不可写）→ fail-open exit 0。T1/T2 同卡扩展：user_prompt_state_inject.sh 每轮落盘用户 prompt 授权台账 user_prompts_<sid>.log；pre_bash_guard.sh 新增 merge/push 授权硬门（凭台账近期授权词并集窗口放行 + append-only CONSUMED 单次消费；code_review_v1 S-1 增 prompt_id 幂等键，双注册双触发不误拒）。PreToolUse(Edit|Write|MultiEdit) 守卫与 PostToolUse(Edit|Write|MultiEdit) 生命周期不同、不冲突。",
   "hooks": {
     "SessionStart": [
       {
@@ -61,6 +61,24 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/pretool_skill_usage_log.sh\""
+          }
+        ]
+      },
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/pretool_agent_delegation_guard.sh\""
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/pretool_summary_flip_guard.sh\""
           }
         ]
       }

@@ -471,6 +471,54 @@ _g1_should_yield() {
   return 1
 }
 
+# ---------- 用户授权台账落盘（feat-hitl-authz-hardening · T1 · AC-1）----------
+# 每轮把真实用户 prompt 原文 + ISO8601 时间戳追加写入 $STATE_DIR/user_prompts_<sid>.log（append-only · 一行一条）。
+# 该台账是 T2（merge/push 授权硬门）的证据源——由本 hook 在真实用户输入时落盘，正常流程模型不触碰（纪律性护栏非对抗沙箱，蓄意伪造面见 DF-015 R-2）。
+# fail-open（AC-1）：任何异常 return 0，绝不影响既有 prompt_state 注入功能（set -uo pipefail · 无 -e）。
+# 行格式：<ISO8601>\t<单行化 prompt>（jq 优先取完整原文并压单行；无 jq 退回词法提取 + 换行归一）。
+append_user_prompt_ledger() {
+  # $1=stdin_raw $2=state_dir $3=sid
+  local raw="$1" sdir="$2" sid="$3" fullprompt="" ts f
+  [ -n "$raw" ] || return 0
+  sid="$(printf '%s' "${sid:-nosid}" | tr -cd 'A-Za-z0-9._-')"
+  [ -n "$sid" ] || sid="nosid"
+  if command -v jq >/dev/null 2>&1; then
+    # jq -r（raw · 发现③）：取真「原文」裸文本，不带 JSON 外层引号 / 不留 `\n` 转义序列。
+    # 兼容双字段名：真实 UserPromptSubmit 载荷 `.prompt`，另兜底 `.user_prompt` 别名。
+    fullprompt="$(printf '%s' "$raw" | jq -r '.user_prompt // .prompt // empty' 2>/dev/null || true)"
+  fi
+  if [ -z "$fullprompt" ]; then
+    # 退化：词法提取（可能截断至首个引号，尽力而为）
+    fullprompt="$(printf '%s' "$raw" | tr -d '\n\r' \
+      | grep -o '"prompt"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -1 \
+      | sed -E 's/^"prompt"[[:space:]]*:[[:space:]]*//')"
+  fi
+  [ -n "$fullprompt" ] || return 0
+  # 单行化兜底（顺序依据 · D-1）：残留换行/回车/制表 → 空格。**必须置于前缀过滤之前**——
+  # 否则 fullprompt 以换行开头时（如 `\n<task-notification>…`），下方 `sed 's/^[[:space:]]+//'`
+  # 逐行 trim 吃不掉前导 `\n`，_pf_trimmed 仍以换行开头 → case 前缀不匹配 → 伪授权面绕过落盘
+  # （v3 delta 评审 D-1）。先把换行归一为空格，trim 即可吃掉前导空白、前缀匹配才生效。
+  # 兼职保证一行一条：tab 同归一，避免污染 `<ts>\t<prompt>` 台账的 tab 分隔结构（append-only · 发现③）。空串上方已 return。
+  fullprompt="$(printf '%s' "$fullprompt" | tr '\n\r\t' '   ')"
+  # 系统通知轮前缀过滤（feat-hitl-authz-hardening · §9 · 伪授权面）：以下模式开头的轮次经
+  # UserPromptSubmit 通道进来但**非真实用户输入**（后台 agent 结果 / 系统通知 / 本地命令回显），
+  # 若其正文含授权样式文字会让 T2 门误命中 = 伪授权面。故 trim 前导空白后按前缀跳过不落盘。
+  # 方向：fail-closed（只会少记；漏记导致 deny 可由用户重说一句授权补救，绝不多记）。
+  local _pf_trimmed
+  _pf_trimmed="$(printf '%s' "$fullprompt" | sed -E 's/^[[:space:]]+//')"
+  case "$_pf_trimmed" in
+    '<task-notification>'*|'[SYSTEM NOTIFICATION'*|'<local-command-stdout>'*|'<command-name>'*|'<local-command-caveat>'*)
+      return 0 ;;
+  esac
+  ts="$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || true)"
+  [ -n "$ts" ] || return 0
+  mkdir -p "$sdir" 2>/dev/null || return 0
+  # 自忽略（对齐 .harness/state 既有惯例 · 用户 prompt 原文含敏感内容不入 git · UQ-4）
+  [ -f "$sdir/.gitignore" ] || printf '*\n' > "$sdir/.gitignore" 2>/dev/null || true
+  f="$sdir/user_prompts_${sid}.log"
+  printf '%s\t%s\n' "$ts" "$fullprompt" >> "$f" 2>/dev/null || return 0
+}
+
 # ---------- 主流程 ----------
 
 main() {
@@ -508,6 +556,10 @@ main() {
   fi
   _sentinel="$_state_dir/.resident_contract_injected_${_sid}"
   [ -f "$_sentinel" ] || _contract_missing=1
+
+  # T1 用户授权台账落盘（feat-hitl-authz-hardening · AC-1）——置于 g1 让位之后、仅主注入副本落盘，
+  # 避免双活场景 append-only 审计文件双写（与常驻契约哨兵同口径）。fail-open 恒不影响注入。
+  append_user_prompt_ledger "$stdin_raw" "$_state_dir" "$_sid" || true
 
   emit_header
   printf '%s\n' "  仓库根：$root"
