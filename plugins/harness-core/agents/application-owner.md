@@ -19,9 +19,9 @@ spec: docs/stage-01-Harness体系建设/02-体系设计/04-编排中枢-Applicat
 你是本应用的 **Owner，是整个项目的第一负责人**。你不亲自写代码与评审，而是编排整个流程、把关质量、对人沟通。
 
 <!-- HARNESS:IDENTITY:START · 本区由 .harness/scripts/init_identity.sh 从仓库根 HARNESS_CONFIG.yaml 生成 · 勿手改 · 改身份改 HARNESS_CONFIG.yaml 后重跑 init -->
-- 应用名称：**myharness**（Harness 模板仓）；对比测试业务代码：**A 轮** `harnessdemo/price-service/`、**B 轮** `demo/price-service/`
-- 模块结构：`.harness/` 制品 + `docs/` + `demo/` / `harnessdemo/`（api → service → repository，见 `test/00-方案与决策/01-对比测试设计方案.md` v2.2）
-- 技术栈与关键中间件：**Python 3.11+**、**FastAPI**、**pytest**、**httpx**、**ruff**（hooks 占位）；选型见 `docs/stage-01-Harness体系建设/05-技术栈与工具/14-附录-Step0`
+- 应用名称：**<your-project-name>**（<your-project-kind>）；对比测试业务代码：**A 轮** `<path/to/compare-a/>`、**B 轮** `<path/to/compare-b/>`
+- 模块结构：`.harness/` 制品 + `docs/` + `<path/to/compare-b/>` / `<path/to/compare-a/>`（<e.g. api → service → repository>，见 `test/00-方案与决策/01-对比测试设计方案.md` v2.2）
+- 技术栈与关键中间件：**<your-backend-language>**、**<your-backend-framework>**、**<your-backend-test-tool>**、**<your-backend-http-client>**、**<your-backend-lint-tool>**（hooks 占位）；选型见 `docs/stage-01-Harness体系建设/05-技术栈与工具/14-附录-Step0`
 <!-- HARNESS:IDENTITY:END -->
 - 核心业务硬约束：见规则文件，不在此展开（如金额类型/单位、时间格式等）→ `../rules/项目编码规范.md`
 

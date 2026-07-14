@@ -1,0 +1,41 @@
+# HARNESS_CONFIG.yaml.template — 项目身份 SSOT 模板（fix-consumer-harness-config-gap-20260714 · T1）
+#
+# 用途：本文件是 Harness 体系「项目身份」单一事实源（HARNESS_CONFIG.yaml）的**通用占位模板**。
+# 消费方从本模板复制为仓库根 HARNESS_CONFIG.yaml 后，逐键填入本项目实值。
+# 落盘由 session-start `_ensure_harness_config` 专管（create-if-missing）；本模板不进 mirror 覆盖刷新。
+#
+# 填实后请运行：  bash .harness/scripts/init_identity.sh
+# 该脚本会据此幂等刷新 .harness/agents/application-owner.md 模块一身份段（标记块生成区）。
+#
+# 约束（与 init 脚本纯 bash/grep/sed 解析契约一致 · 零外部依赖 · 无 yq/python）：
+#   - 仅扁平浅层 key（禁深嵌套）。
+#   - 值不含行内注释；注释独占一行（以 # 开头）。
+#
+# 可选开关示例（注释形态 · 不激活；如需启用去掉行首 # 并置于扁平 key 位）：
+#   # bootstrap.auto: true
+
+# —— 项目标识 ——
+project_name: <your-project-name>
+project_kind: <your-project-kind>
+project_kind_slug: <your-project-kind-slug>
+
+# —— 对比测试路径（A 轮 / B 轮）——
+compare_path_a: <path/to/compare-a/>
+compare_path_b: <path/to/compare-b/>
+
+# —— 模块结构 ——
+module_layout: <e.g. api → service → repository>
+
+# —— 后端技术栈 ——
+stack_backend: <your-backend-language>
+stack_backend_framework: <your-backend-framework>
+stack_backend_test: <your-backend-test-tool>
+stack_backend_http: <your-backend-http-client>
+stack_backend_lint: <your-backend-lint-tool>
+
+# —— 前端技术栈（多栈预留 · 无则留空）——
+stack_frontend:
+
+# —— 测试约定 ——
+test_command: <your-test-command>
+test_path: <path/to/tests/>

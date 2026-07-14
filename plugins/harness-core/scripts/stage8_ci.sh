@@ -83,7 +83,7 @@ done
 config="${config:-$ROOT/HARNESS_CONFIG.yaml}"
 run_cwd="${run_cwd:-$ROOT}"
 
-[ -f "$config" ]      || die "配置文件不存在: $config"
+[ -f "$config" ]      || die "配置文件不存在: $config（可从 plugins 包 HARNESS_CONFIG.yaml.template 复制为仓库根 HARNESS_CONFIG.yaml 并填实值）"
 [ -d "$run_cwd" ]     || die "--cwd 目录不存在: $run_cwd"
 [ -x "$EVAL_GATE" ] || [ -f "$EVAL_GATE" ] || die "冻结判定器缺失: $EVAL_GATE"
 

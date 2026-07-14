@@ -277,6 +277,11 @@ _scaffold_new_project() {
     fi
   fi
 
+  # 2b. 挂点①（fix-consumer-harness-config-gap-20260714 · AC-3.4）：
+  #     镜像 agents 落盘之后 → HARNESS_CONFIG.yaml create-if-missing 落盘 + 刷镜像身份段。
+  #     新项目路径 config 恒缺失 → 落占位版；身份刷新以刚落盘的镜像 agents 为 --target。
+  _ensure_harness_config
+
   # 3. 复制 rules 目录
   if [ -d "$PLUGIN_RULES" ]; then
     mkdir -p "$RULES_DIR"
@@ -482,6 +487,16 @@ _drift_sync() {
     log_info "drift-sync 完成：刷新 ${refreshed} · 复活 ${revived} · 定制跳过 ${skipped}（权威源=plugin 缓存 · 单向）"
   fi
 
+  # 无条件身份重锚（M-1 修复 · code_review_v1 选项 A · AC-3.6）：单点收敛落于 _drift_sync
+  # 函数体末尾，故 _drift_sync 的**每条调用点**（L679 .scaffold_initialized 分支 / L701 主流程
+  # CHANGES_DIR 分支）均自动被覆盖，杜绝逐调用点补写漏项。
+  # 根因闭环：_drift_sync 的 plain-cp 是身份无感知的（T5 后权威源身份段=占位），可能把占位
+  # 权威源 cp 进镜像 application-owner.md（三方判定命中「安全覆盖刷新」时）；紧随其后以本地
+  # config 无条件重跑 init_identity 重写镜像身份段，同会话内即把占位洗回消费方实值（自愈 · 含
+  # 修复已被占位污染的存量镜像）。config/target/init 任一缺失时 _refresh_mirror_identity 内部
+  # 静默短路、非阻断（沿用既有防呆）；init_identity 幂等，重复调用安全。
+  _refresh_mirror_identity
+
   # auto-bootstrap 失败重试（opt-out 默认开 · ADR-015；F-6 挂函数体尾部）：
   # 谓词 enabled + .bootstrap_done 缺失 + .bootstrap_attempted 存在（M-2c 前置门 ·
   # 存量 pre-upgrade 项目零追溯 AC-5a）+ .bootstrap_running 缺失或 pid 已死（R4-01）
@@ -558,6 +573,80 @@ _restore_claudemd() {
 }
 
 # ============================================================
+# 函数：HARNESS_CONFIG.yaml create-if-missing 落盘 + 镜像身份段刷新
+# （fix-consumer-harness-config-gap-20260714 · T2+T3）
+#   - AC-2.1/2.2：仓库根无 HARNESS_CONFIG.yaml 时自模板 create-if-missing 落盘占位版；
+#     已存在（含用户已填实值）→ 零写入、不改字节（幂等，绝不覆盖）
+#   - AC-3.1/3.2/3.4/3.5：落盘后立即以镜像 .harness/agents/application-owner.md 为 --target
+#     跑 init_identity.sh 刷身份段（占位 config → 镜像身份段不再含权威源实值）；
+#     --target 目标不存在时静默跳过、不 die；失败必 || log_warn 兜底，永不阻断 session
+#   - 顺序硬约束：置于镜像 agents 落盘之后（挂点①）/ _drift_sync semi-backfill 之前（挂点③），
+#     同会话内 semi-backfill 即可读到新 config 回填成功（AC-2.4）
+#   - 模板/脚本定位回退链对齐 _restore_claudemd / _maybe_auto_bootstrap 先例（PLUGIN_ROOT → 开发态/镜像态）
+# ============================================================
+
+_refresh_mirror_identity() {
+  # 可独立安全调用（M-1 修复 · 无条件重锚前提 · code_review_v1 选项 A）：
+  #   config / target / init_identity 三者任一缺失即静默跳过、不 die、不阻断——
+  #   使本函数可在 _drift_sync 末尾无条件调用而不产生伪告警。幂等（init_identity 本身幂等）。
+  # config 缺失静默短路：init_identity 缺 config 会 exit 1（fail-closed 契约），此处提前
+  #   return 0 免去 else 分支的伪告警噪声（_drift_sync 两处调用点 config 恒在，此守卫仅兜底）。
+  [ -f "$TOP/HARNESS_CONFIG.yaml" ] || return 0
+  # AC-3.4：--target（镜像 application-owner.md）不存在时静默跳过、不 die
+  [ -f "$AGENTS_DIR/application-owner.md" ] || return 0
+
+  # init_identity.sh 定位（优先 plugin 侧，回落 .harness 镜像侧）
+  local init_sh=""
+  if [ -f "$PLUGIN_ROOT/scripts/init_identity.sh" ]; then
+    init_sh="$PLUGIN_ROOT/scripts/init_identity.sh"
+  elif [ -f "$TOP/.harness/scripts/init_identity.sh" ]; then
+    init_sh="$TOP/.harness/scripts/init_identity.sh"
+  fi
+  if [ -z "$init_sh" ]; then
+    log_warn "未找到 init_identity.sh（PLUGIN_ROOT/scripts 与 .harness/scripts 均无），跳过镜像身份段刷新"
+    return 0
+  fi
+
+  # AC-3.5 非阻断：init_identity 失败 || log_warn 兜底，不中断 session-start 初始化；
+  # stdout 并入 stderr 保持 hook stdout 干净（对齐 _maybe_auto_bootstrap 风格）
+  if bash "$init_sh" --target "$AGENTS_DIR/application-owner.md" --config "$TOP/HARNESS_CONFIG.yaml" >&2; then
+    log_info "✅ 已刷新镜像身份段（.harness/agents/application-owner.md ← HARNESS_CONFIG.yaml）"
+  else
+    log_warn "init_identity.sh 刷新镜像身份段失败（非阻断），镜像身份段可能仍含旧值；可手动运行 bash .harness/scripts/init_identity.sh --target .harness/agents/application-owner.md"
+  fi
+  return 0
+}
+
+_ensure_harness_config() {
+  # AC-2.2 幂等：已存在（含用户已填实值）→ 直接返回，零写入、不改字节
+  [ -f "$TOP/HARNESS_CONFIG.yaml" ] && return 0
+
+  # 模板定位（回退链：PLUGIN_ROOT → 本仓开发态，对齐 _restore_claudemd 先例）
+  local tpl=""
+  if [ -f "$PLUGIN_ROOT/HARNESS_CONFIG.yaml.template" ]; then
+    tpl="$PLUGIN_ROOT/HARNESS_CONFIG.yaml.template"
+  elif [ -f "$TOP/plugins/harness-core/HARNESS_CONFIG.yaml.template" ]; then
+    tpl="$TOP/plugins/harness-core/HARNESS_CONFIG.yaml.template"
+  fi
+  if [ -z "$tpl" ]; then
+    log_warn "HARNESS_CONFIG.yaml 缺失且未找到模板 HARNESS_CONFIG.yaml.template（PLUGIN_ROOT / 开发态均无），跳过落盘；可手动参考 plugins/harness-core/HARNESS_CONFIG.yaml.template 创建"
+    return 0
+  fi
+
+  # AC-2.1 create-if-missing：自模板落盘占位版为仓库根 HARNESS_CONFIG.yaml
+  if cp "$tpl" "$TOP/HARNESS_CONFIG.yaml" 2>/dev/null; then
+    log_info "✅ 已落盘 HARNESS_CONFIG.yaml（占位模板 · 来自 $tpl）；请编辑该文件填实值后重跑 bash .harness/scripts/init_identity.sh（或等下次会话自动回填）"
+  else
+    log_warn "HARNESS_CONFIG.yaml 落盘写入失败（$TOP/HARNESS_CONFIG.yaml），跳过（不阻断会话）"
+    return 0
+  fi
+
+  # AC-3.1：落盘后立即以镜像 agents/application-owner.md 为 --target 刷身份段
+  _refresh_mirror_identity
+  return 0
+}
+
+# ============================================================
 # 守卫：定位仓库根
 # ============================================================
 
@@ -599,6 +688,10 @@ PLUGIN_RULES="$PLUGIN_ROOT/rules"
 STATE_DIR="${HARNESS_STATE_DIR:-$TOP/.harness/state}"
 if [ -f "$STATE_DIR/.scaffold_initialized" ]; then
   # 已初始化，走镜像单向自动同步后退出（路径变量已就绪）
+  # 挂点③（fix-consumer-harness-config-gap-20260714 · AC-2.3②/2.4）：
+  #   _drift_sync（内含 semi-backfill）之前落 config + 刷镜像身份段，
+  #   同会话内 semi-backfill 即可读到新 config 回填成功；config 已存在则幂等零写入。
+  _ensure_harness_config
   _drift_sync
   _restore_claudemd  # 收尾路径 (A)：drift-sync 之后 create-if-missing 复原 CLAUDE.md（T1）
   exit 0

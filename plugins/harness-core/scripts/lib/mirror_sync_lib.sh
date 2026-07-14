@@ -221,7 +221,16 @@ _mirror_semi_backfill() {
     rm -f "$tmp" 2>/dev/null; echo "semi-mv-failed: $dest" >> "$creport"; return 1
   fi
   rm -f "$tmp" 2>/dev/null
-  echo "semi-backfill-failed: $dest" >> "$creport"
+  # 失败归因细分（AC-4.1）：回填失败最常见根因 = 消费方仓库根缺 HARNESS_CONFIG.yaml（init_identity exit 1）。
+  # 与 init_identity 同口径解析仓库根 config（git 顶层，回落 PWD），缺失则写可行动提示、区别于其它失败态。
+  local _cfg_top _cfg
+  _cfg_top="$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"
+  _cfg="$_cfg_top/HARNESS_CONFIG.yaml"
+  if [ ! -f "$_cfg" ]; then
+    echo "semi-backfill-failed-config-missing: $dest（创建仓库根 HARNESS_CONFIG.yaml（可从 HARNESS_CONFIG.yaml.template 复制）后下次会话自动回填）" >> "$creport"
+  else
+    echo "semi-backfill-failed: $dest" >> "$creport"
+  fi
   return 1
 }
 

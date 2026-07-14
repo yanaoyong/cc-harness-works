@@ -54,3 +54,9 @@ custom  rules/架构规范.md
 #    分发已直达消费方，无 E-1 类缺口）→ 直刷镜像=死刷新 → 保持 opt-out。
 # 未来 .harness/commands/ 出现真消费点时，删除下行 `opt-out` 一字即重新纳入刷新。
 machine  commands/*  opt-out
+
+# ── HARNESS_CONFIG 模板（machine 类 · 默认 opt-out · fix-consumer-harness-config-gap-20260714 · HITL 决议）──
+# 登记备审但不进 mirror 覆盖刷新：消费方项目身份 HARNESS_CONFIG.yaml 的落盘由 session-start
+#   `_ensure_harness_config`（create-if-missing 从本模板复制）专管，非镜像刷新职责。此处 opt-out
+#   仅使模板纳入 sync-manifest 分类台账备审，避免覆盖消费方已填实值。
+machine  HARNESS_CONFIG.yaml.template  opt-out
