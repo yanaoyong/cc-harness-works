@@ -1,0 +1,56 @@
+# sync-manifest — 镜像分层刷新分类单源（fix-mirror-upgrade-propagation-20260714 · T1 · FR-2）
+#
+# 消费方：session_start_mirror_sync.sh（经 scripts/lib/mirror_sync_lib.sh 解析）+ harness_bootstrap.sh（组件 opt-out 探测）。
+# 权威源 = plugins/harness-core/（= 消费方 $CLAUDE_PLUGIN_ROOT）；镜像 = 消费方 .harness/。
+#
+# 行格式（扁平 · bash/grep/sed 可解析 · 零外部解析器 · bash 3.2 兼容）：
+#     <class>  <glob>  [opt-out]
+#   - <class> ∈ machine | semi | custom
+#   - <glob>  = 权威源根相对路径 glob（在 shell `case` 语义下匹配，`*` 递归匹配含 `/`）
+#   - opt-out（可选第三字段）= 该 glob 默认不刷新（保留登记、改一行即重新纳入）
+#   - `#` 起始行 = 注释；空行忽略
+#
+# 三分类策略（spec §2）：
+#   machine（覆盖刷新）：权威源较新内容覆盖镜像（受哈希台账本地改动保护）。
+#   semi（半定制件）：覆盖后对含 HARNESS:IDENTITY 标记块的文件重跑 init_identity 回填身份段（临时文件+原子替换）。
+#   custom（定制件）：永不自动覆盖；检测上游模板变化→产出「待处理级联评估」提示留人裁决。
+#
+# 匹配优先级不变量（FR-2 · SH-3 · 消费端 mirror_sync_classify 实现）：
+#   ① custom 类恒优先于任何 machine/semi glob（custom 恒胜）；
+#   ② 其余重叠取最长（最具体）path glob 匹配胜出。
+#
+# 镜像落点映射（消费端 mirror_sync_dest_rel）：默认 `X` → `.harness/X`；
+#   例外 `_template/_TEMPLATE/X` → `.harness/changes/_TEMPLATE/X`。
+
+# ── 机器件（machine · 覆盖刷新）──
+machine  components/*
+machine  scripts/*
+machine  skills/*
+machine  workflows/*
+machine  _template/_TEMPLATE/*
+
+# rules/ 分类口径（spec §2.1 · SH-5）：除 4 定制件外全部机器件（现 12 文件）+ 缺省规则（未来新增 rules 默认落 machine）。
+# 现 12 机器件 rules（经 rules/* 缺省 machine 兜住 · 逐一登记备审）：
+#   开发流程规范.md 文档wiki查询与摄取规范.md codegraph查询路由与精度规范.md 验收回填与证据捕获规范.md
+#   体系设计原则.md 测试守护规范.md 验收执行规范.md CLI调用规范.md CLI调用规范-codegraph.md
+#   wiki产物数据规范.md 开发流程操作教训.md README.md
+machine  rules/*
+
+# ── 半定制件（semi · 覆盖 + 身份回填）──
+# agents/* 全归 semi：含 HARNESS:IDENTITY 标记块的（application-owner.md）覆盖后重跑 init_identity 回填身份段；
+# 无标记块的（reviewer/generator/strategist/entropy/README）semi 处理器等价纯覆盖（无身份段可回填）。
+semi  agents/*
+
+# ── 定制件（custom · 永不覆盖 · custom 恒胜任何上方 machine/semi glob）──
+# 注：API设计规范.md / 架构规范.md 虽存于 rules/，其内容为项目派生模板、消费方按项目定制，故归 custom（安全侧 · SH-5）。
+custom  rules/工程结构.md
+custom  rules/项目编码规范.md
+custom  rules/API设计规范.md
+custom  rules/架构规范.md
+
+# ── commands（machine 类 · 默认 opt-out · UQ-3 v2 限定 · SH-6 / HITL-2 C-2 认可）──
+# 消费落点核实（T1 子项 · 2026-07-14）：镜像目标 .harness/commands/ 现无运行时消费方
+#   （Claude Code 读 .claude/commands/ 与 plugin manifest，不读 .harness/commands/；plugin 原生 commands
+#    分发已直达消费方，无 E-1 类缺口）→ 直刷镜像=死刷新 → 保持 opt-out。
+# 未来 .harness/commands/ 出现真消费点时，删除下行 `opt-out` 一字即重新纳入刷新。
+machine  commands/*  opt-out

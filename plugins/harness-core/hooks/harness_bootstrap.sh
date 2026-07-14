@@ -327,10 +327,56 @@ _persist_component() {
   return 0
 }
 
+# 组件源根解析（本仓开发态优先 → plugin 缓存 · 对齐 _persist_component base 家法）
+_components_src_root() {
+  if [ -d "$TOP/plugins/harness-core/components" ]; then
+    printf '%s\n' "$TOP/plugins/harness-core/components"
+  elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -d "${CLAUDE_PLUGIN_ROOT}/components" ]; then
+    printf '%s\n' "${CLAUDE_PLUGIN_ROOT}/components"
+  fi
+}
+
+# 组件是否 manifest opt-out（fix-mirror-upgrade-propagation T3 · sync-manifest 可 opt-out · 缺 manifest 则一律纳入）
+_component_opted_out() {
+  # $1 = 组件名；0 = opt-out（跳过）；1 = 纳入
+  local name="$1" mf=""
+  if [ -r "$TOP/plugins/harness-core/sync-manifest" ]; then
+    mf="$TOP/plugins/harness-core/sync-manifest"
+  elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -r "${CLAUDE_PLUGIN_ROOT}/sync-manifest" ]; then
+    mf="${CLAUDE_PLUGIN_ROOT}/sync-manifest"
+  fi
+  [ -n "$mf" ] || return 1
+  grep -Eq "^[^#].*[[:space:]]components/${name}(/\*)?[[:space:]]+.*opt-out([[:space:]]|$)" "$mf" 2>/dev/null
+}
+
+# 组件全枚举落盘（fix-mirror-upgrade-propagation-20260714 · T3 · FR-7 · 修 E-3 acceptance-backfill 缺口）：
+#   遍历权威源 components/* 全部子目录（manifest 可 opt-out），不再写死 codegraph/wiki-engine。
+#   codegraph/wiki-engine 仍单独记 *_HOME_OK 供步骤⑤ skill 注册消费。
 CODEGRAPH_HOME_OK=0
 WIKI_HOME_OK=0
-if _persist_component codegraph;   then CODEGRAPH_HOME_OK=1; else DEGRADED=1; fi
-if _persist_component wiki-engine; then WIKI_HOME_OK=1;      else DEGRADED=1; fi
+_csrc="$(_components_src_root)"
+if [ -n "$_csrc" ]; then
+  for _cdir in "$_csrc"/*/; do
+    [ -d "$_cdir" ] || continue
+    _cname="$(basename "$_cdir")"
+    if _component_opted_out "$_cname"; then
+      log_info "组件 $_cname：manifest 标记 opt-out，跳过落盘"
+      continue
+    fi
+    if _persist_component "$_cname"; then
+      case "$_cname" in
+        codegraph)   CODEGRAPH_HOME_OK=1 ;;
+        wiki-engine) WIKI_HOME_OK=1 ;;
+      esac
+    else
+      DEGRADED=1
+    fi
+  done
+else
+  # 源根不可见（持久落点已存在场景）：退回原两组件幂等探测
+  if _persist_component codegraph;   then CODEGRAPH_HOME_OK=1; else DEGRADED=1; fi
+  if _persist_component wiki-engine; then WIKI_HOME_OK=1;      else DEGRADED=1; fi
+fi
 
 # ============================================================
 # 步骤②：探测/安装引擎（sha256 fail-closed · AC-8）

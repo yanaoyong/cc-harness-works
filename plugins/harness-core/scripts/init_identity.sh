@@ -1,26 +1,64 @@
 #!/usr/bin/env bash
 # init_identity.sh — 从 HARNESS_CONFIG.yaml 幂等生成 application-owner.md 模块一身份段（S-003）。
 # 用法:
-#   bash .harness/scripts/init_identity.sh
+#   bash .harness/scripts/init_identity.sh                       # 默认：定位默认候选 application-owner.md
+#   bash init_identity.sh --target <application-owner.md 路径>   # 显式目标（镜像刷新场景 · fix-mirror-upgrade-propagation T5）
+#   bash init_identity.sh --config <HARNESS_CONFIG.yaml 路径>    # 覆写配置源（默认取仓库根）
 # 行为:
 #   读仓库根 HARNESS_CONFIG.yaml（扁平 yaml · 纯 bash/grep/sed 解析 · 零外部依赖 · 不调第三方解析器）,
 #   只替换 application-owner.md 中 HARNESS:IDENTITY:START/END 标记块之间的内容（块外字节不动）。
 # 幂等: 同一配置连跑两次，application-owner.md 字节一致（标记保留、生成区整体重写）。
 # 注: 模块四 10 阶段表格内的对比路径/测试命令引用为人工改静的静态配置指针，本脚本不注入该处。
+#
+# --target 防呆（fix-mirror-upgrade-propagation-20260714 · SH-1 · R-1）：
+#   ① 显式传 --target 时**禁回落默认候选顺序**（只用传入路径）；
+#   ② 镜像刷新场景**禁 target 指向权威源 plugins/harness-core/agents/application-owner.md**
+#      （否则本仓自托管态误跑会把消费方身份段写进权威源、污染 application-owner.md）。
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"
-CONFIG="$ROOT/HARNESS_CONFIG.yaml"
 
-# R-001 迁移后的 application-owner.md 在 plugins/harness-core/agents/ 下（优先）
-# 兼容旧布局：.harness/agents/ 为 fallback
-OWNER=""
-for candidate in "$ROOT/plugins/harness-core/agents/application-owner.md" "$ROOT/.harness/agents/application-owner.md"; do
-  if [ -f "$candidate" ]; then
-    OWNER="$candidate"
-    break
-  fi
+# ---------- 旗标解析（--target / --config · 无旗标时保持原默认行为）----------
+TARGET=""
+CONFIG_OVERRIDE=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --target)
+      [ "$#" -ge 2 ] || { echo "ERROR: --target 需要路径参数" >&2; exit 2; }
+      TARGET="$2"; shift 2 ;;
+    --config)
+      [ "$#" -ge 2 ] || { echo "ERROR: --config 需要路径参数" >&2; exit 2; }
+      CONFIG_OVERRIDE="$2"; shift 2 ;;
+    -h|--help)
+      echo "用法: init_identity.sh [--target <application-owner.md 路径>] [--config <HARNESS_CONFIG.yaml 路径>]" >&2
+      exit 0 ;;
+    *)
+      echo "ERROR: 未知参数: $1" >&2; exit 2 ;;
+  esac
 done
+
+CONFIG="${CONFIG_OVERRIDE:-$ROOT/HARNESS_CONFIG.yaml}"
+
+if [ -n "$TARGET" ]; then
+  # 防呆②：禁 target 指向权威源 application-owner.md（防污染权威身份段）
+  case "$TARGET" in
+    */plugins/harness-core/agents/application-owner.md|plugins/harness-core/agents/application-owner.md)
+      echo "ERROR: --target 禁止指向权威源 plugins/harness-core/agents/application-owner.md（防污染权威身份段 · R-1 防呆）" >&2
+      exit 3 ;;
+  esac
+  # 防呆①：显式传参禁回落默认候选顺序——只用传入路径
+  OWNER="$TARGET"
+else
+  # R-001 迁移后的 application-owner.md 在 plugins/harness-core/agents/ 下（优先）
+  # 兼容旧布局：.harness/agents/ 为 fallback
+  OWNER=""
+  for candidate in "$ROOT/plugins/harness-core/agents/application-owner.md" "$ROOT/.harness/agents/application-owner.md"; do
+    if [ -f "$candidate" ]; then
+      OWNER="$candidate"
+      break
+    fi
+  done
+fi
 
 START_MARK='HARNESS:IDENTITY:START'
 END_MARK='HARNESS:IDENTITY:END'
