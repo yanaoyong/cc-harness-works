@@ -20,6 +20,21 @@
 # 禁裸 set -e（AC-10：脚本错误变非 0 退出会误伤委派）——用 set -uo pipefail + 逐命令容错。
 set -uo pipefail
 
+# harness_state_root —— STATE_DIR 根解析单一口径（方案甲 · 锚 CLAUDE_PROJECT_DIR · 内联兜底逐字同
+# lib/shell-utils.sh · feat-segmentation-and-statedir-fix-20260714 T-B）。会话中途 cwd 漂移下稳定。
+# 本 hook 原写端口径已锚 CLAUDE_PROJECT_DIR（族 B · 正确），此处仅归一到单一命名口径、行为零回归。
+if ! type harness_state_root >/dev/null 2>&1; then
+  harness_state_root() {
+    local top
+    top="$(git -C "${CLAUDE_PROJECT_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$top" ]; then
+      printf '%s\n' "$top"
+      return 0
+    fi
+    printf '%s\n' "${CLAUDE_PROJECT_DIR:-$PWD}"
+  }
+fi
+
 # ---- 读取 payload（bash 内建 read；空 stdin/EOF 容错）----
 payload=""
 IFS= read -r -d '' payload || true
@@ -58,8 +73,8 @@ fi
 
 if [ "$ok_model" = "1" ] && [ "$ok_budget" = "1" ] && [ "$ok_whitelist" = "1" ] && [ "$ok_strict" = "1" ]; then
   # ---- 放行 + 写委派台账（AC-6）。写失败 = 纯副作用失败 → 仍放行（AC-10.c）----
-  root_dir="$(git -C "${CLAUDE_PROJECT_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null || true)"
-  [ -n "$root_dir" ] || root_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+  # STATE_DIR 根走 harness_state_root() 统一口径（方案甲 · T-B）
+  root_dir="$(harness_state_root)"
   sdir="${HARNESS_STATE_DIR:-$root_dir/.harness/state}"
   sid="$(printf '%s' "${session_id:-nosid}" | tr -cd 'A-Za-z0-9._-')"
   [ -n "$sid" ] || sid="nosid"

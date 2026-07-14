@@ -36,13 +36,69 @@
 set -uo pipefail
 
 PREFIX_CONTRACT="[harness:resident_contract]"
+PREFIX_SEG="[harness:segment_handoff]"
+
+# harness_state_root —— STATE_DIR 根解析单一口径（方案甲 · 锚 CLAUDE_PROJECT_DIR · 内联兜底逐字同
+# lib/shell-utils.sh · feat-segmentation-and-statedir-fix-20260714 T-B）。会话中途 cwd 漂移下稳定。
+# 本 hook 原为族 A（裸 git rev-parse · 跟 cwd）；STATE_DIR/哨兵归一到锚 CLAUDE_PROJECT_DIR，
+# 内容 BASE 定位仍用 TOP（跟 cwd 是其应然 · 只统一 STATE_DIR 解析）。
+if ! type harness_state_root >/dev/null 2>&1; then
+  harness_state_root() {
+    local top
+    top="$(git -C "${CLAUDE_PROJECT_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$top" ]; then
+      printf '%s\n' "$top"
+      return 0
+    fi
+    printf '%s\n' "${CLAUDE_PROJECT_DIR:-$PWD}"
+  }
+fi
+
+# T-A3 交接哨兵消费辅助（feat-segmentation-and-statedir-fix-20260714）：读字符串字段（词法·无 jq 依赖）
+_seg_json_field() {
+  # $1=字段名 $2=文件
+  grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$2" 2>/dev/null | head -1 \
+    | sed -E "s/^\"$1\"[[:space:]]*:[[:space:]]*\"//; s/\"$//"
+}
+_consume_segment_handoff() {
+  # SessionStart 四 source 检测新鲜哨兵（<HARNESS_SEGMENT_TTL 秒 · 默认 86400=24h · U-2 env 可调）→
+  # 注入 [harness:segment_handoff] 续推指令 + 单次消费改名 .consumed（陈旧/时钟异常不注入不劫持 · AC-A3）。
+  # STATE_DIR 已由 harness_state_root() 统一口径解析（与写侧 harness_write_segment_handoff 同源 · AC-A3-4）。
+  local hf ttl ts card stage note ep now age
+  hf="$STATE_DIR/segment_handoff.json"
+  [ -f "$hf" ] && [ -r "$hf" ] || return 0
+  ttl="${HARNESS_SEGMENT_TTL:-}"
+  case "$ttl" in ''|*[!0-9]*) ttl=86400 ;; esac          # 非数字/空 → 回退默认（禁写死不可调）
+  ts="$(_seg_json_field ts "$hf")"
+  ep="$(date -d "$ts" +%s 2>/dev/null || true)"
+  [ -n "$ep" ] || ep="$(stat -c %Y "$hf" 2>/dev/null || stat -f %m "$hf" 2>/dev/null || true)"
+  [ -n "$ep" ] || return 0                               # 无法判定时效 → 保守不注入（防陈旧劫持）
+  now="$(date +%s 2>/dev/null || echo 0)"
+  [ "$now" != "0" ] || return 0
+  age=$(( now - ep ))
+  { [ "$age" -ge 0 ] && [ "$age" -lt "$ttl" ]; } || return 0   # 陈旧(≥TTL)/未来时钟 → 不注入不劫持（AC-A3-3）
+  card="$(_seg_json_field target_card "$hf")"
+  stage="$(_seg_json_field next_stage "$hf")"
+  note="$(_seg_json_field note "$hf")"
+  # 单次消费：先改名失活再注入——即便注入后异常，哨兵已失活不会二次劫持（AC-A3-3）
+  mv "$hf" "$hf.consumed" 2>/dev/null || true
+  printf '%s 检测到新鲜分段交接哨兵（跨会话续推指令 · 单次消费 · 已失活）\n' "$PREFIX_SEG"
+  printf '  目标卡目录：%s\n' "${card:-（未知）}"
+  printf '  下一步阶段：%s\n' "${stage:-（未知）}"
+  printf '  交接注：%s\n' "${note:-（无）}"
+  printf '  哨兵时间：%s\n' "${ts:-（未知）}"
+  printf '  指示：收到用户任意输入后，按 CLAUDE.md「启动序列」直接续推该卡（勿再询问目标实例）；本哨兵已消费失活，不再劫持后续会话。\n'
+  printf '\n'
+}
 
 # 守卫① 自定位仓库根；非 git / 定位失败 → 静默退出 0
 TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 [ -z "$TOP" ] && exit 0
 cd "$TOP" || exit 0
 
-STATE_DIR="${HARNESS_STATE_DIR:-$TOP/.harness/state}"
+# STATE_DIR 根走 harness_state_root()（方案甲 · 会话内稳定 · T-B）——常驻契约哨兵与交接哨兵均落此，
+# 与 UserPromptSubmit 读端同口径；/clear 前后 cwd 不变亦同 STATE_DIR（AC-A3-4 / AC-B-3）。
+STATE_DIR="${HARNESS_STATE_DIR:-$(harness_state_root)/.harness/state}"
 
 # 守卫①.5 过渡期兼容：旧版 CLAUDE.md 仍含 @import 双串 → 跳过注入 + 提示迁移（防双份加载）
 if [ -f "$TOP/CLAUDE.md" ] \
@@ -64,6 +120,9 @@ if [ ! -t 0 ]; then
   fi
 fi
 SENTINEL="$STATE_DIR/.resident_contract_injected_${SID}"
+
+# T-A3 交接哨兵消费（独立于契约注入 · 置于 BASE 解析前，BASE 不可读也能续推 · 恒不阻断）
+_consume_segment_handoff || true
 
 # 守卫② 注入源三级回退链（目录级 · 首个"四文件全可读"的 base 即用）
 _all_readable() {

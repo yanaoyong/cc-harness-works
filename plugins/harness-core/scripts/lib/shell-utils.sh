@@ -63,6 +63,55 @@ resolve_roots() {
   printf '%s\n' "$PWD"
 }
 
+# harness_state_root —— 会话内稳定的 STATE_DIR 根解析（方案甲 · 锚 CLAUDE_PROJECT_DIR · U-1）：
+#   feat-segmentation-and-statedir-fix-20260714 · T-B · spec §5.1 U-1 裁决。
+#   口径：git -C "${CLAUDE_PROJECT_DIR:-$PWD}" rev-parse --show-toplevel（族 B 读端既有口径）
+#         → 失败回退 ${CLAUDE_PROJECT_DIR:-$PWD}。
+#   为何锚 CLAUDE_PROJECT_DIR 而非 resolve_root()（裸 git rev-parse · 跟 cwd）：会话中途
+#   EnterWorktree 改 cwd 时，裸 git rev-parse 漂到 worktree（族 A 写端 bug · spec §1.2），
+#   而 CLAUDE_PROJECT_DIR 是会话起点项目根、不随 cwd 漂 → 读写落同一 STATE_DIR。
+#   **不改 resolve_root() 本体**（它另供 .harness/changes 内容 / 契约注入源定位 · 跟 cwd 是其应然）。
+#   本函数是 STATE_DIR 解析的**单一权威口径**；各 hook 若未 source 本 lib，内联兜底逐字复制本体
+#   （与既有 resolve_root 内联兜底同家法 · 字节一致 · 防漂移）。
+# stdout 输出单个根路径；恒返回 0。
+harness_state_root() {
+  local top
+  top="$(git -C "${CLAUDE_PROJECT_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -n "$top" ]; then
+    printf '%s\n' "$top"
+    return 0
+  fi
+  printf '%s\n' "${CLAUDE_PROJECT_DIR:-$PWD}"
+}
+
+# _harness_json_escape <str> —— 最小 JSON 字符串体转义（segment_handoff 写侧用）：
+#   剔控制字符（换行/回车/制表）→ 反斜杠、双引号转义（保证单行 JSON 合法）。
+#   顺序：先剔控制字符再转义（对齐 l_sanitize_scope 家法）。
+_harness_json_escape() {
+  printf '%s' "$1" | tr -d '\n\r\t' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# harness_write_segment_handoff —— T-A3 写侧极简入口（feat-segmentation-and-statedir-fix-20260714）：
+#   Owner 在用户采纳分段建议时调用，落 $STATE_DIR/segment_handoff.json（跨会话交接 · 不带 sid）。
+#   $1=目标卡目录（如 .harness/changes/<card>） $2=下一步阶段（如 3 / 7） $3=一句交接注。
+#   STATE_DIR 走 harness_state_root() 统一口径（与 SessionStart 消费侧同源 · /clear 前后同目录）。
+#   HARNESS_STATE_DIR 覆写语义保留。写成功返回 0；异常返回 1（Owner 可感知，但绝不 die）。
+#   Owner 调用示例（source 本 lib 后一行调用）：
+#     . <lib>/shell-utils.sh && harness_write_segment_handoff ".harness/changes/<card>" "3" "阶段2 已评审通过，续推编码"
+harness_write_segment_handoff() {
+  local root sdir f ts
+  root="$(harness_state_root)"
+  sdir="${HARNESS_STATE_DIR:-$root/.harness/state}"
+  mkdir -p "$sdir" 2>/dev/null || return 1
+  [ -f "$sdir/.gitignore" ] || printf '*\n' > "$sdir/.gitignore" 2>/dev/null || true
+  ts="$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || true)"
+  f="$sdir/segment_handoff.json"
+  printf '{"target_card":"%s","next_stage":"%s","note":"%s","ts":"%s"}\n' \
+    "$(_harness_json_escape "$1")" "$(_harness_json_escape "$2")" \
+    "$(_harness_json_escape "$3")" "${ts:-unknown}" > "$f" 2>/dev/null || return 1
+  return 0
+}
+
 # warn <msg> —— 统一 stderr warning 输出（不阻断 · 不改退出码）。
 warn() { printf 'warning: %s\n' "$1" >&2; }
 

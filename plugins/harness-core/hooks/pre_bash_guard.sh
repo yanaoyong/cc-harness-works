@@ -8,6 +8,21 @@
 # 性能（NFR-P / AC-7）：快速路径零外部子进程；重路径子进程预算 ≤2（jq ≤1 + 仅 A-2 场景 git ≤1）；全部匹配用 bash 内建 [[ =~ ]]，无外部 grep
 set -euo pipefail
 
+# harness_state_root —— STATE_DIR 根解析单一口径（方案甲 · 锚 CLAUDE_PROJECT_DIR · 内联兜底逐字同
+# lib/shell-utils.sh · feat-segmentation-and-statedir-fix-20260714 T-B）。会话中途 cwd 漂移下稳定。
+# 本 hook 原读端口径已锚 CLAUDE_PROJECT_DIR（族 B · 正确），此处仅归一到单一命名口径、行为零回归。
+if ! type harness_state_root >/dev/null 2>&1; then
+  harness_state_root() {
+    local top
+    top="$(git -C "${CLAUDE_PROJECT_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$top" ]; then
+      printf '%s\n' "$top"
+      return 0
+    fi
+    printf '%s\n' "${CLAUDE_PROJECT_DIR:-$PWD}"
+  }
+fi
+
 # ---- 读取 payload：bash 内建 read（零子进程；空 stdin / EOF 容错）----
 payload=""
 IFS= read -r -d '' payload || true
@@ -264,9 +279,8 @@ if [[ -n "$_authz_gate" ]]; then
     [[ -z "$_aw_action" ]] && _aw_action='推送|push|PR'
   fi
 
-  # 台账定位（与 T1 写端同口径：STATE_DIR + session_id）
-  _root_dir="$(git -C "${CLAUDE_PROJECT_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null || true)"
-  [[ -z "$_root_dir" ]] && _root_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+  # 台账定位（与 T1 写端同口径：STATE_DIR + session_id）——harness_state_root() 统一口径（方案甲 · T-B）
+  _root_dir="$(harness_state_root)"
   _sdir="${HARNESS_STATE_DIR:-$_root_dir/.harness/state}"
   _sid=""
   if command -v jq >/dev/null 2>&1; then

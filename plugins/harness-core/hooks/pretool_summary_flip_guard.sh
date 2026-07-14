@@ -41,6 +41,94 @@ has_phase_passed() {
   printf '%s' "$text" | grep -qE "$re" 2>/dev/null
 }
 
+# harness_state_root —— STATE_DIR 根解析单一口径（方案甲 · 锚 CLAUDE_PROJECT_DIR · 内联兜底逐字同
+# lib/shell-utils.sh · feat-segmentation-and-statedir-fix-20260714 T-B）。会话中途 cwd 漂移下稳定。
+if ! type harness_state_root >/dev/null 2>&1; then
+  harness_state_root() {
+    local top
+    top="$(git -C "${CLAUDE_PROJECT_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$top" ]; then
+      printf '%s\n' "$top"
+      return 0
+    fi
+    printf '%s\n' "${CLAUDE_PROJECT_DIR:-$PWD}"
+  }
+fi
+
+# ---- T-A2 方案 P：阶段边界记号（旁路副作用 · 与下方 1/3/5 门禁判定式完全解耦 · 不改门禁）----
+# 检测本次 summary 编辑是否翻牌 阶段2→PASSED（2→3 边界）/ 阶段6→PASSED（6→7 边界），命中即落
+# stage_progress_<sid> 记号（<ISO8601>\t<card>\t<2to3|6to7>）供 UserPromptSubmit 分段建议消费（AC-A2-4）。
+# 独立解析（不复用 1/3/5 门禁变量），保证「门禁判定式一字不改」；每 (card,boundary) 每会话仅记一次。
+SEG_FLIP_RE_2='\|[[:space:]]*2[[:space:]]+[^|]*\|[[:space:]]*PASSED([[:space:]]|\|)'
+SEG_FLIP_RE_6='\|[[:space:]]*6[[:space:]]+[^|]*\|[[:space:]]*PASSED([[:space:]]|\|)'
+_seg_has_phase() {
+  # $1=文本 $2=2|6；命中返回 0（独立于门禁 has_phase_passed）
+  local text="$1" ph="$2" re
+  case "$ph" in 2) re="$SEG_FLIP_RE_2" ;; 6) re="$SEG_FLIP_RE_6" ;; *) return 1 ;; esac
+  printf '%s' "$text" | grep -qE "$re" 2>/dev/null
+}
+_seg_write_marker() {
+  # $1=boundary(2to3|6to7) $2=card ; 旁路副作用 · 写失败静默 · 恒不改退出码
+  local boundary="$1" card="$2" root sdir sid ts mfile
+  root="$(harness_state_root)"
+  sdir="${HARNESS_STATE_DIR:-$root/.harness/state}"
+  sid="$(jq -r '.session_id // empty' <<<"$payload" 2>/dev/null || true)"
+  sid="$(printf '%s' "${sid:-nosid}" | tr -cd 'A-Za-z0-9._-')"
+  [ -n "$sid" ] || sid="nosid"
+  mfile="$sdir/stage_progress_${sid}.log"
+  # 每 (card,boundary) 每会话去重（防重复 summary 编辑刷屏 · 稳定 keyfile 键）
+  if [ -r "$mfile" ] && awk -F'\t' -v c="$card" -v b="$boundary" \
+       '($2==c && $3==b){f=1} END{exit f?0:1}' "$mfile" 2>/dev/null; then
+    return 0
+  fi
+  ts="$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || true)"
+  mkdir -p "$sdir" 2>/dev/null || return 0
+  [ -f "$sdir/.gitignore" ] || printf '*\n' > "$sdir/.gitignore" 2>/dev/null || true
+  printf '%s\t%s\t%s\n' "${ts:-unknown}" "$card" "$boundary" >> "$mfile" 2>/dev/null || true
+}
+_seg_detect_and_mark() {
+  # 独立解析 payload（tool_name/card_dir 已在主流程就绪），检测 2/6 翻牌 → 落记号。
+  local nedits i new old ph b nstr
+  if [ "$tool_name" = "Write" ]; then
+    nstr="$(jq -r '.tool_input.content // empty' <<<"$payload" 2>/dev/null || true)"
+    [ -n "$nstr" ] || return 0
+    for ph in 2 6; do
+      if _seg_has_phase "$nstr" "$ph"; then
+        [ "$ph" = 2 ] && b=2to3 || b=6to7
+        _seg_write_marker "$b" "$card_dir"
+      fi
+    done
+  elif [ "$tool_name" = "MultiEdit" ]; then
+    nedits="$(jq -r '.tool_input.edits | length // empty' <<<"$payload" 2>/dev/null || true)"
+    case "$nedits" in ''|*[!0-9]*) return 0 ;; esac
+    i=0
+    while [ "$i" -lt "$nedits" ]; do
+      new="$(jq -r --argjson j "$i" '.tool_input.edits[$j].new_string // empty' <<<"$payload" 2>/dev/null || true)"
+      old="$(jq -r --argjson j "$i" '.tool_input.edits[$j].old_string // empty' <<<"$payload" 2>/dev/null || true)"
+      i=$((i + 1))
+      [ -n "$new" ] || continue
+      for ph in 2 6; do
+        if _seg_has_phase "$new" "$ph"; then
+          _seg_has_phase "$old" "$ph" && continue   # old 已 PASSED → 非翻牌
+          [ "$ph" = 2 ] && b=2to3 || b=6to7
+          _seg_write_marker "$b" "$card_dir"
+        fi
+      done
+    done
+  else
+    new="$(jq -r '.tool_input.new_string // empty' <<<"$payload" 2>/dev/null || true)"
+    old="$(jq -r '.tool_input.old_string // empty' <<<"$payload" 2>/dev/null || true)"
+    [ -n "$new" ] || return 0
+    for ph in 2 6; do
+      if _seg_has_phase "$new" "$ph"; then
+        _seg_has_phase "$old" "$ph" && continue
+        [ "$ph" = 2 ] && b=2to3 || b=6to7
+        _seg_write_marker "$b" "$card_dir"
+      fi
+    done
+  fi
+}
+
 # ---- 读取 payload ----
 payload=""
 IFS= read -r -d '' payload || true
@@ -66,6 +154,9 @@ esac
 # 提取卡目录名（.harness/changes/ 与 /summary.md 之间的段）
 card_dir="$(printf '%s' "$file_path" | sed -E 's#.*\.harness/changes/([^/]+)/summary\.md$#\1#')"
 [ -z "$card_dir" ] && exit 0
+
+# T-A2 方案 P：落阶段边界记号（旁路副作用 · 恒不改下方门禁判定式与退出码）
+_seg_detect_and_mark || true
 
 # ---- 翻牌判定（Write 全文覆写 vs Edit 局部片段 · 不对称 · B2）----
 flipped=""
@@ -113,8 +204,8 @@ fi
 [ -n "$flipped" ] || exit 0
 
 # ---- 交叉核验 T3 委派台账 ----
-root_dir="$(git -C "${CLAUDE_PROJECT_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null || true)"
-[ -n "$root_dir" ] || root_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+# STATE_DIR 根走 harness_state_root() 统一口径（方案甲 · 与写端同源 · feat-segmentation-and-statedir-fix T-B）。
+root_dir="$(harness_state_root)"
 sdir="${HARNESS_STATE_DIR:-$root_dir/.harness/state}"
 session_id="$(jq -r '.session_id // empty' <<<"$payload" 2>/dev/null || true)"
 sid="$(printf '%s' "${session_id:-nosid}" | tr -cd 'A-Za-z0-9._-')"

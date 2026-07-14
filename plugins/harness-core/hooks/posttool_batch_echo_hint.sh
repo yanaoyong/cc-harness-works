@@ -52,6 +52,21 @@ set -uo pipefail
 PREFIX="[harness:batch_echo]"
 WINDOW=10   # U-2 写死
 
+# harness_state_root —— STATE_DIR 根解析单一口径（方案甲 · 锚 CLAUDE_PROJECT_DIR · 内联兜底逐字同
+# lib/shell-utils.sh · feat-segmentation-and-statedir-fix-20260714 T-B）。会话中途 cwd 漂移下稳定。
+# 本 hook 原为族 A（裸 git rev-parse · 跟 cwd）——正是 worktree STATE_DIR 漂移 bug 写端之一，此处归一修复。
+if ! type harness_state_root >/dev/null 2>&1; then
+  harness_state_root() {
+    local top
+    top="$(git -C "${CLAUDE_PROJECT_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$top" ]; then
+      printf '%s\n' "$top"
+      return 0
+    fi
+    printf '%s\n' "${CLAUDE_PROJECT_DIR:-$PWD}"
+  }
+fi
+
 # 写类 denylist（U-4 · 命中即破窗）：git 变更子命令 / 文件系统写（含裸 rm）/ 重定向 / 原地编辑 / 安装类。
 # 边界（v2）：命令首词或经 空白 &|;( 及引号 "' 分隔后出现即命中（引号入边界 → bash -c/sh -c
 # 包裹串亦命中；xargs rm 经空白边界命中）；重定向 `>`（含 `>>`）出现即命中。
@@ -59,9 +74,9 @@ _WRITE_RE="(^|[[:space:]&|;(\"'])(git[[:space:]]+(commit|push|merge|reset|rebase
 # 脚本化阶段豁免（AC-T1-5 · 命中即破窗·不计只读）
 _EXEMPT_RE='stage7_push\.sh|stage8_ci\.sh'
 
-# ---------- 仓库根 / STATE_DIR 定位（三级回退 · 与既有 hook 同口径）----------
-_TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-if [ -z "$_TOP" ]; then _TOP="${CLAUDE_PROJECT_DIR:-$PWD}"; fi
+# ---------- 仓库根 / STATE_DIR 定位（方案甲 · harness_state_root 统一口径 · 会话内稳定 · T-B）----------
+# 原族 A 裸 git rev-parse 跟 cwd → worktree 会话漂到 worktree 侧（bug）；改锚 CLAUDE_PROJECT_DIR。
+_TOP="$(harness_state_root)"
 STATE_DIR="${HARNESS_STATE_DIR:-$_TOP/.harness/state}"
 
 # ---------- 读取 stdin payload（不阻塞）----------

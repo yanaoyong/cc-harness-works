@@ -100,6 +100,20 @@ if ! type resolve_root >/dev/null 2>&1; then
   }
 fi
 
+# harness_state_root —— STATE_DIR 根解析单一口径（方案甲 · 锚 CLAUDE_PROJECT_DIR · 内联兜底逐字同
+# lib/shell-utils.sh · feat-segmentation-and-statedir-fix-20260714 T-B）。会话中途 cwd 漂移下稳定。
+if ! type harness_state_root >/dev/null 2>&1; then
+  harness_state_root() {
+    local top
+    top="$(git -C "${CLAUDE_PROJECT_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$top" ]; then
+      printf '%s\n' "$top"
+      return 0
+    fi
+    printf '%s\n' "${CLAUDE_PROJECT_DIR:-$PWD}"
+  }
+fi
+
 # ---------- L 豁免读写函数（可被 source 单测 · 路径经 L_EXEMPTIONS_FILE 覆写）----------
 
 l_file_path() {
@@ -519,6 +533,82 @@ append_user_prompt_ledger() {
   printf '%s\t%s\n' "$ts" "$fullprompt" >> "$f" 2>/dev/null || return 0
 }
 
+# ---------- 上下文水位（T-A1 · feat-segmentation-and-statedir-fix-20260714）----------
+# compute_water_sum <transcript_path>：取 transcript 最后一条 assistant 消息的
+#   usage.cache_read_input_tokens + usage.cache_creation_input_tokens 之和（原始 token 数）。
+# 口径 = 40 卡扫描标定同源（U-5 · cache_read+cache_creation，不叠加 input_tokens）。
+# fail-open（AC-A1-2）：jq 缺 / transcript 不可读 / 无 assistant / usage 缺 / 和为 0 → 返回 1（调用方跳过该行）。
+compute_water_sum() {
+  local tp="$1" usage cr cc sum
+  [ -n "$tp" ] && [ -r "$tp" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  # 末 200 行内最后一条带 usage 的 assistant 消息（与 batch_echo 取 message 同法 · tail 限行防大文件）
+  usage="$(tail -n 200 "$tp" 2>/dev/null \
+    | jq -rc 'select(.type=="assistant") | select(.message.usage != null) | .message.usage' 2>/dev/null \
+    | tail -n 1)"
+  [ -n "$usage" ] || return 1
+  cr="$(printf '%s' "$usage" | jq -r '.cache_read_input_tokens // 0' 2>/dev/null || echo 0)"
+  cc="$(printf '%s' "$usage" | jq -r '.cache_creation_input_tokens // 0' 2>/dev/null || echo 0)"
+  case "$cr" in ''|*[!0-9]*) cr=0 ;; esac
+  case "$cc" in ''|*[!0-9]*) cc=0 ;; esac
+  sum=$(( cr + cc ))
+  [ "$sum" -gt 0 ] || return 1
+  printf '%s' "$sum"
+}
+
+# ---------- 分段建议（T-A2 · 三条件缺一不触发 · 旁路提示恒 exit 0）----------
+# 允许切点白名单仅 2 处：2→3（HITL-2 决议后）/ 6→7（阶段6 闭合后）（AC-A2-1）。
+# 阈值 env 可调（AC-A2-2 · 禁写死）：HARNESS_SEGMENT_T2 默认 160000 / HARNESS_SEGMENT_T6 默认 200000；
+#   env 未设/空/非数字 → 回退默认。
+# 三条件（AC-A2-3）：水位≥对应阈值 ∧ 活跃卡恰处允许边界 ∧ 该边界事件发生在本会话内——
+#   后两者由 stage_progress_<sid> 记号承载（方案 P · summary_flip_guard 放行路径落 · 本会话内 summary 阶段翻牌）。
+#   纯查询 / 未推卡会话无该记号 → 零建议（AC-A2-4）。
+# 单次去重：同一边界事件（卡+边界+记号时间戳）仅建议一次（keyfile segment_suggest_lastfire_<sid>）。
+_seg_threshold_default() { case "$1" in 2to3) printf '160000' ;; 6to7) printf '200000' ;; *) printf '' ;; esac; }
+_seg_threshold_env() {
+  # $1=边界；返回该边界阈值（env 覆写 · 非数字回退默认）
+  local b="$1" v def
+  def="$(_seg_threshold_default "$b")"
+  case "$b" in
+    2to3) v="${HARNESS_SEGMENT_T2:-}" ;;
+    6to7) v="${HARNESS_SEGMENT_T6:-}" ;;
+    *) printf '%s' "$def"; return 0 ;;
+  esac
+  case "$v" in ''|*[!0-9]*) printf '%s' "$def" ;; *) printf '%s' "$v" ;; esac
+}
+
+emit_segment_suggest() {
+  # $1=water_sum(原始 token · 空表示水位不可得) $2=state_dir $3=sid
+  local wsum="$1" sdir="$2" sid="$3" marker last card boundary mts thr key kf lastkey
+  [ -n "$wsum" ] || return 0                          # 水位不可得 → 不建议（三条件之一缺）
+  case "$wsum" in ''|*[!0-9]*) return 0 ;; esac
+  marker="$sdir/stage_progress_${sid}.log"
+  [ -r "$marker" ] || return 0                        # 本会话无阶段边界记号 → 零建议（AC-A2-4）
+  # 最近一条边界记号：<ISO8601>\t<card_dir>\t<boundary(2to3|6to7)>
+  last="$(tail -n 1 "$marker" 2>/dev/null || true)"
+  [ -n "$last" ] || return 0
+  mts="$(printf '%s' "$last" | awk -F'\t' '{print $1}')"
+  card="$(printf '%s' "$last" | awk -F'\t' '{print $2}')"
+  boundary="$(printf '%s' "$last" | awk -F'\t' '{print $3}')"
+  case "$boundary" in 2to3|6to7) ;; *) return 0 ;; esac   # 白名单外边界 → 不建议（AC-A2-1）
+  thr="$(_seg_threshold_env "$boundary")"
+  case "$thr" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$wsum" -ge "$thr" ] || return 0                  # 水位未达阈值 → 不建议（三条件之一缺）
+  # 单次去重（同一边界事件仅建议一次）
+  key="${card}|${boundary}|${mts}"
+  kf="$sdir/segment_suggest_lastfire_${sid}"
+  lastkey="$(cat "$kf" 2>/dev/null || true)"
+  [ "$lastkey" = "$key" ] && return 0
+  printf '%s\n' "$key" > "$kf" 2>/dev/null || true
+  local wk stage
+  wk=$(( wsum / 1000 ))
+  case "$boundary" in 2to3) stage="阶段2→3（HITL-2 决议后）" ;; 6to7) stage="阶段6→7（阶段6 闭合后）" ;; esac
+  printf '\n'
+  printf '%s\n' "  ✂️ [harness:segment_suggest] 分段建议（旁路·可无视）：当前上下文水位≈${wk}k 已达阈值 $(( thr / 1000 ))k，且本会话刚跨越 ${stage} 边界（卡 ${card}）。"
+  printf '%s\n' "     建议在此阶段边界分段续跑（/clear 同窗优先于新窗口，二者均优于 /compact）以省主循环缓存成本——见开发流程规范 DF-017。"
+  printf '%s\n' "     采纳则 Owner 先写交接哨兵（source lib 后 \`harness_write_segment_handoff \"${card}\" \"<下一步阶段>\" \"<一句交接注>\"\`），/clear 后新会话按启动序列自动续推该卡；注意授权台账按 sid 隔离，切前授权失效需切后重授。"
+}
+
 # ---------- 主流程 ----------
 
 main() {
@@ -547,7 +637,12 @@ main() {
   fi
 
   # 常驻契约会话哨兵检测（T8.3 · P4）：session-keyed（session_id 自 stdin payload · 与写端同口径）
-  local _state_dir="${HARNESS_STATE_DIR:-$root/.harness/state}" _sid="nosid" _upi_sid _sentinel _contract_missing=0
+  # STATE_DIR 根走 harness_state_root()（方案甲 · 会话内稳定 · feat-segmentation-and-statedir-fix T-B）——
+  # 与 pre_bash_guard / summary_flip_guard 读端同口径，worktree 会话读写落同一目录（AC-B）。
+  # 注意：changes_dir 仍用 root=resolve_root()（内容定位·跟 cwd 是其应然），只统一 STATE_DIR 解析。
+  local _state_root _state_dir _sid="nosid" _upi_sid _sentinel _contract_missing=0
+  _state_root="$(harness_state_root)"
+  _state_dir="${HARNESS_STATE_DIR:-$_state_root/.harness/state}"
   if [ -n "$stdin_raw" ]; then
     _upi_sid="$(printf '%s' "$stdin_raw" | tr -d '\n\r' \
       | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -1 \
@@ -561,8 +656,19 @@ main() {
   # 避免双活场景 append-only 审计文件双写（与常驻契约哨兵同口径）。fail-open 恒不影响注入。
   append_user_prompt_ledger "$stdin_raw" "$_state_dir" "$_sid" || true
 
+  # 上下文水位（T-A1）：transcript_path 自 UserPromptSubmit stdin payload 取（官方 hook 公共字段）；
+  # 水位 = 最后 assistant usage(cache_read+cache_creation)。fail-open：任一环节缺 → _water 留空、水位行静默跳过。
+  local _tp="" _water=""
+  if [ -n "$stdin_raw" ] && command -v jq >/dev/null 2>&1; then
+    _tp="$(printf '%s' "$stdin_raw" | jq -r '.transcript_path // empty' 2>/dev/null || true)"
+  fi
+  [ -n "$_tp" ] && _water="$(compute_water_sum "$_tp" || true)"
+
   emit_header
   printf '%s\n' "  仓库根：$root"
+  if [ -n "$_water" ]; then
+    printf '  上下文水位≈%sk\n' "$(( _water / 1000 ))"
+  fi
   if [ "$_contract_missing" = "1" ]; then
     printf '%s\n' "  ⚠️ [harness:resident_contract] 会话哨兵缺失（SessionStart 注入未生效/被压缩）→ 本轮兜底补注入完整调度契约（附于块末·一次性）。A 类决策契约仍在 CLAUDE.md 恒重载。"
   fi
@@ -581,6 +687,8 @@ main() {
   emit_actions
   printf '\n'
   emit_wiki_nudge
+  # 分段建议（T-A2 · 三条件缺一不触发 · 旁路提示 · 恒 exit 0）
+  emit_segment_suggest "$_water" "$_state_dir" "$_sid"
   # 兜底补注入置于块末（哨兵缺失时 · 一次性落哨兵防每轮重复）
   if [ "$_contract_missing" = "1" ]; then
     emit_contract_fallback "$root" "$_sentinel"
