@@ -34,6 +34,15 @@
 #   1  脚本自身错误：用法错误 / 配置缺失 / test_command 无法执行（命令不存在·不可执行·被信号杀死）
 #      / outputParser 解析失败（三行输出格式不全）/ eval_gate_contract 未给出判定
 #      —— 任一错误路径均以 stderr 报错原因退出，绝不伪造 gate=PASS。
+#
+# known-red baseline（可选 · 默认关 · myharness 本仓专属 · chore-ci-baseline-and-stage9-script-20260714）:
+#   HARNESS_CONFIG.yaml 扁平键 known_red_baseline_path 指向入库基线清单（永久段 [permanent] + flaky 段 [flaky]）:
+#     - 键缺失 或 值为空 → 基线关：行为与本改动前逐字节一致（ci_result.md 全文 + 退出码 · 消费方零影响 · AC-6）。
+#     - 键为非空路径     → 基线启用：在冻结判定器 raw gate 之上叠加纯 shell 集合比对——
+#         实际失败集 ⊆ 基线集 → baseline-adjusted 绿（exit 0）；有基线外失败 → 红（exit 2）；
+#         基线文件缺失/不可读 → fail-closed（exit 1 · 绝不静默判绿 · AC-5）。
+#       raw frozen gate 仍如实计算并呈现于 ci_result.md，但基线启用时不驱动退出码（ADR-005 语义不变 · AC-4/AC-21）。
+#       flaky 段内条目基线外撞红 → 定点重跑一次（本地 runner），绿即放行、仍红判红；段外基线外失败一律红（AC-8b）。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,7 +55,7 @@ PARSER_VITEST="$SCRIPT_DIR/parse_vitest_summary.sh"
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 usage() {
-  sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-1}"
 }
 
@@ -104,6 +113,22 @@ fi
 
 test_path="$(get_yaml test_path)"
 
+# ---------- known-red baseline: 读取配置 + fail-closed 前置（默认关 · AC-5/AC-6）----------
+# 键缺失 或 值为空 → baseline_enabled=false：后续基线层完全短路，行为与改动前逐字节一致（AC-6）。
+# 键为非空路径 → baseline_enabled=true：此处即做 fail-closed 前置（文件不可读 → die exit 1 · AC-5），
+#   在跑测试前尽早失败，绝不静默判绿。
+baseline_path="$(get_yaml known_red_baseline_path)"
+baseline_enabled="false"
+baseline_file=""
+if [ -n "$baseline_path" ]; then
+  baseline_enabled="true"
+  case "$baseline_path" in
+    /*) baseline_file="$baseline_path" ;;
+    *)  baseline_file="$ROOT/$baseline_path" ;;
+  esac
+  [ -r "$baseline_file" ] || die "known_red_baseline_path 已配置（'$baseline_path'）但基线文件不可读: $baseline_file（fail-closed · AC-5：基线启用时文件缺失绝不静默判绿）"
+fi
+
 # ---------- T3: 条件追加 test_path（AC-14 / AC-14b / AC-15 / AC-16 · fix-script-dist-and-gate-fixes）----------
 # 背景：HARNESS_CONFIG.yaml 同时声明 test_command（可能无路径）与 test_path，此前 test_path
 #       只用于 ci_result.md 展示、未喂给执行 → 默认调用在仓库根裸跑，误收集仓外测试触发
@@ -141,6 +166,11 @@ runner_takes_path() {
     *) return 1 ;;
   esac
 }
+
+# known-red baseline · flaky 定点重跑用：记录 test_path 追加前的 runner 原串（AC-8b）。
+# 重跑单 node-id 时以该原串（剥除与 test_path 完全相等的词元）为 runner 前缀，避免把整个
+# test_path 再跑一遍（如 `pytest -q tests/ <node-id>` 会连 tests/ 全量重跑）。
+test_command_orig="$test_command"
 
 if [ -n "$test_path" ]; then
   case "$test_command" in
@@ -287,6 +317,109 @@ if [ "$gate" = "FAIL" ]; then
   fi
 fi
 
+# ---------- known-red baseline: 纯 shell 集合比对层（仅 baseline_enabled=true 时执行 · AC-1/2/8b/9/21）----------
+# 定位（ADR-005 语义不变 · AC-4）：本层是叠加的独立判定层——上方 raw gate 由冻结判定器如实给出、
+#   零改动、仍在 ci_result.md 呈现；基线启用时最终退出码改随本层 baseline-adjusted verdict（AC-21）。
+# 比对键（AC-9）：test node-id——对 `FAILED <file>::<test> - <reason>` / `ERROR <file> - <reason>`
+#   剥除 FAILED/ERROR 前缀与 ` - <reason>` 尾串（reason 文案漂移不影响比对）。
+# 集合运算（AC-3 纯 shell）：sort -u + comm，零模型/零网络/零密钥。
+
+# 把失败行规整为 node-id 键（stdin → stdout · 每行一个 · 排序去重）
+normalize_failure_ids() {
+  sed -e 's/^FAILED[[:space:]]*//' -e 's/^ERROR[[:space:]]*//' -e 's/ - .*$//' \
+    -e 's/[[:space:]]*$//' | grep -v '^$' | sort -u || true
+}
+
+# 从基线文件抽取一节（$1=节名）：节头下一行起至下一节头/EOF；忽略注释行与空行；剥首尾空白。
+baseline_section() {
+  sed -n "/^\[$1\]/,/^\[/p" "$baseline_file" \
+    | grep -v '^\[' | grep -v '^[[:space:]]*#' \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+    | grep -v '^$' | sort -u || true
+}
+
+baseline_verdict=""        # GREEN | RED（仅 baseline_enabled=true 时有值）
+baseline_verdict_label=""
+bl_actual_count=0; bl_covered_count=0; bl_red_count=0; bl_flaky_passed_count=0; bl_stale_count=0
+bl_covered=""; bl_red=""; bl_flaky_passed=""; bl_flaky_failed=""; bl_stale=""
+if [ "$baseline_enabled" = "true" ]; then
+  # 格式校验（fail-closed）：基线文件须含 [permanent] 节头，否则视为格式错误（exit 1 · 不静默判绿）。
+  grep -q '^\[permanent\]' "$baseline_file" \
+    || die "基线文件缺少 [permanent] 节头（格式不可机械解析 · fail-closed）: $baseline_file"
+
+  bl_tmp="$(mktemp -d "${TMPDIR:-/tmp}/stage8_baseline.XXXXXX")"
+  printf '%s\n' "$failures" | normalize_failure_ids > "$bl_tmp/actual"
+  baseline_section permanent > "$bl_tmp/permanent"
+  baseline_section flaky     > "$bl_tmp/flaky"
+
+  bl_actual_count=$(grep -c . "$bl_tmp/actual" || true)
+  comm -12 "$bl_tmp/actual" "$bl_tmp/permanent" > "$bl_tmp/covered"   # 基线覆盖（永久段命中）
+  comm -23 "$bl_tmp/actual" "$bl_tmp/permanent" > "$bl_tmp/outside"   # 基线外失败集
+  comm -13 "$bl_tmp/actual" "$bl_tmp/permanent" > "$bl_tmp/stale"     # stale 告警（永久段未撞红 · R2 增强 · 非阻断）
+  comm -12 "$bl_tmp/outside" "$bl_tmp/flaky"    > "$bl_tmp/out_flaky" # 基线外 ∩ flaky 段 → 定点重跑一次
+  comm -23 "$bl_tmp/outside" "$bl_tmp/flaky"    > "$bl_tmp/out_hard"  # 基线外 ∖ flaky 段 → 一律红不重跑
+
+  # flaky 定点重跑（AC-8b）：仅 flaky 段内、且落在基线外失败集的条目——对该单 node-id
+  # 本地再调用一次测试 runner（恰好一次 · 不循环）；绿→放行并标注，仍红→判红列出。
+  # 【injection 硬化 · coding_report_v2】node-id 一律作为**独立 argv 元素**直接传给 runner，
+  #   绝不内插进 `bash -c` 字符串——彻底消除 shell 元字符注入面（如基线文件里的恶意 node-id
+  #   `tests/x.py::t'; touch /tmp/pwn; echo '` 不再被求值执行），且天然兼容含 `[` `]` `'` 空格的
+  #   合法参数化 node-id（无需引号转义）。runner 前缀 = test_path 追加前的 test_command 原串
+  #   （剥除与 test_path 完全相等的词元），按词元拆进数组 rerun_cmd[]，直接展开执行（无二次
+  #   shell 解析）；node-id 作 runner 的位置参数被当作用例选择器字面收集，非命令行。
+  rerun_cmd=()
+  if [ -s "$bl_tmp/out_flaky" ]; then
+    for bl_tok in $test_command_orig; do
+      if [ -n "$test_path" ] && [ "$bl_tok" = "$test_path" ]; then continue; fi
+      rerun_cmd+=("$bl_tok")
+    done
+    while IFS= read -r bl_id; do
+      [ -n "$bl_id" ] || continue
+      if [ "${#rerun_cmd[@]}" -eq 0 ]; then
+        echo "[stage8_ci] flaky 重跑无法构造 runner 前缀（test_command 空）→ 保守判红: $bl_id" >&2
+        printf '%s\n' "$bl_id" >> "$bl_tmp/flaky_failed"
+        continue
+      fi
+      echo "[stage8_ci] flaky 定点重跑（恰一次 · AC-8b · node-id 作独立 argv 传参）: ${rerun_cmd[*]} <node-id>" >&2
+      set +e
+      ( cd "$run_cwd" && "${rerun_cmd[@]}" "$bl_id" ) >>"$log_file.flaky" 2>&1
+      bl_rerun_exit=$?
+      set -e
+      if [ "$bl_rerun_exit" -eq 0 ]; then
+        echo "[stage8_ci]   → exit 0（重跑绿 · 放行）" >&2
+        printf '%s\n' "$bl_id" >> "$bl_tmp/flaky_passed"
+      else
+        echo "[stage8_ci]   → exit $bl_rerun_exit（重跑仍红 · 判红）" >&2
+        printf '%s\n' "$bl_id" >> "$bl_tmp/flaky_failed"
+      fi
+    done < "$bl_tmp/out_flaky"
+  fi
+  : >> "$bl_tmp/flaky_passed"; : >> "$bl_tmp/flaky_failed"
+
+  # 最终基线外红集 = 段外基线外失败 ∪ flaky 重跑仍红
+  sort -u "$bl_tmp/out_hard" "$bl_tmp/flaky_failed" | grep -v '^$' > "$bl_tmp/red" || true
+
+  bl_covered="$(cat "$bl_tmp/covered")";           bl_covered_count=$(grep -c . "$bl_tmp/covered" || true)
+  bl_red="$(cat "$bl_tmp/red")";                   bl_red_count=$(grep -c . "$bl_tmp/red" || true)
+  bl_flaky_passed="$(cat "$bl_tmp/flaky_passed")"; bl_flaky_passed_count=$(grep -c . "$bl_tmp/flaky_passed" || true)
+  bl_flaky_failed="$(cat "$bl_tmp/flaky_failed")"
+  bl_stale="$(cat "$bl_tmp/stale")";               bl_stale_count=$(grep -c . "$bl_tmp/stale" || true)
+
+  # verdict（AC-21 三态中的 0/2 两态；1=脚本错误已由上方 die 路径承担）：
+  #   gate=PASS（真绿·零失败）→ GREEN；
+  #   gate=FAIL 且未提取到用例级失败行 → RED（无法归因：收集期错误/total==0 等——基线不掩盖，留 Owner）；
+  #   gate=FAIL 且基线外红集为空 → GREEN（raw 红但基线覆盖）；否则 RED。
+  if [ "$gate" = "PASS" ]; then
+    baseline_verdict="GREEN"; baseline_verdict_label="绿（真绿 · 零失败，未消费基线）"
+  elif [ "$bl_actual_count" -eq 0 ]; then
+    baseline_verdict="RED";   baseline_verdict_label="红（gate=FAIL 但未提取到用例级失败行——基线无法归因该红，不掩盖：疑似收集期错误 / 用例数 0 / runner 输出格式非预期，留 Owner 处置）"
+  elif [ "$bl_red_count" -eq 0 ]; then
+    baseline_verdict="GREEN"; baseline_verdict_label="绿（raw 红但全部失败已由基线覆盖）"
+  else
+    baseline_verdict="RED";   baseline_verdict_label="红（存在基线外失败 · 共 $bl_red_count 条，见下方基线外新增失败清单）"
+  fi
+fi
+
 # ---------- AC-2: 生成 ci_result.md 机械段（全部字段来自 parser + eval_gate_contract）----------
 # 门禁三行表 = 冻结判定式 `exit == 0 && total > 0 && passed == total`（eval_gate_contract.sh:47）
 # 三个条件的**如实复述**（ADR-005 · code_review_v1 M-1 修复）：
@@ -381,6 +514,81 @@ EOF
 待 Owner 归因（疑似 flaky / 基线既有红 / 真回归）。**脚本不做归因判断**——本节由 Owner 在阶段 8 人工填写。
 EOF
   fi
+
+  # ---- known-red baseline 比对段（仅基线启用时输出 · 基线关时本函数输出与改动前逐字节一致 = AC-6）----
+  if [ "$baseline_enabled" = "true" ]; then
+    cat <<EOF
+
+## known-red baseline 比对（叠加层 · 纯 shell 集合比对）
+
+> 本节为叠加的独立判定层（AC-4 · ADR-005 语义不变）：上方门禁三行表与 \`gate=$gate\` 仍由冻结判定器
+> \`eval_gate_contract.sh\` 如实给出、零改动；基线启用时**最终退出码跟随本节 baseline-adjusted verdict**
+> （子集→0 / 超集→2 / 脚本错误→1 · AC-21），raw gate 不再驱动退出码。
+> 基线文件: \`$baseline_path\`（入库 tracked · 更新须走变更卡 · AC-7）。比对键 = 剥除 reason 尾串的
+> test node-id（AC-9）。
+
+| 项 | 值 |
+|---|---|
+| baseline-adjusted verdict | $baseline_verdict_label |
+| 实际失败 node-id 数 | $bl_actual_count |
+| 基线覆盖（永久段命中） | $bl_covered_count |
+| 基线外失败（最终判红） | $bl_red_count |
+| flaky 重跑后放行 | $bl_flaky_passed_count |
+| stale 基线告警（永久段未撞红） | $bl_stale_count |
+EOF
+    if [ "$gate" = "FAIL" ] && [ "$bl_red_count" -eq 0 ] && [ "$bl_actual_count" -gt 0 ]; then
+      cat <<EOF
+
+**全部失败已由基线覆盖**（raw 红但基线覆盖 ≠ 真绿——被覆盖红条目如下，供 Owner 一眼核对）：
+EOF
+    fi
+    if [ -n "$bl_covered" ]; then
+      cat <<EOF
+
+### 基线覆盖条目（永久段命中 · 已知既有红）
+\`\`\`
+$bl_covered
+\`\`\`
+EOF
+    fi
+    if [ -n "$bl_red" ]; then
+      cat <<EOF
+
+### 基线外新增失败（判红 · 与基线内红分列）
+\`\`\`
+$bl_red
+\`\`\`
+EOF
+    fi
+    if [ -n "$bl_flaky_passed" ]; then
+      cat <<EOF
+
+### flaky 重跑后放行（AC-8b · 每条恰重跑一次 · 重跑日志: \`$log_file.flaky\`）
+\`\`\`
+$bl_flaky_passed
+\`\`\`
+EOF
+    fi
+    if [ -n "$bl_flaky_failed" ]; then
+      cat <<EOF
+
+### flaky 重跑仍红（已计入上方基线外失败）
+\`\`\`
+$bl_flaky_failed
+\`\`\`
+EOF
+    fi
+    if [ -n "$bl_stale" ]; then
+      cat <<EOF
+
+### ⚠ stale 基线告警（非阻断 · R2 增强）
+以下永久段条目本次**未**出现在实际失败集——基线可能已过期（对应红已修复），请走变更卡复核收缩基线，抑制基线只增不减：
+\`\`\`
+$bl_stale
+\`\`\`
+EOF
+    fi
+  fi
 }
 
 if [ -z "$out" ] && [ -n "$card" ]; then
@@ -400,7 +608,20 @@ fi
 
 echo "[stage8_ci] gate=$gate reason=${gate_reason:-n/a} (status=$status total_tests=$total_tests passed=$passed)" >&2
 
-# 规则命中（gate=FAIL）如实以 exit 2 返回；与脚本自身错误（exit 1）区分。
+# ---------- 退出码 ----------
+# 基线启用（AC-21）：最终退出码跟随 baseline-adjusted verdict——子集（绿）→0 / 超集（红）→2；
+#   脚本自身错误（含基线文件缺失 fail-closed）已在上方 die 路径以 exit 1 承担。
+#   raw gate 仍在 ci_result.md 如实呈现，但不驱动退出码（ADR-005 · 判定器本体零改动）。
+if [ "$baseline_enabled" = "true" ]; then
+  echo "[stage8_ci] baseline-adjusted verdict=$baseline_verdict (actual=$bl_actual_count covered=$bl_covered_count outside_red=$bl_red_count flaky_passed=$bl_flaky_passed_count stale=$bl_stale_count baseline=$baseline_path)" >&2
+  if [ "$baseline_verdict" = "GREEN" ]; then
+    exit 0
+  else
+    exit 2
+  fi
+fi
+
+# 基线关（默认 · AC-6 向后兼容路径）：规则命中（gate=FAIL）如实以 exit 2 返回；与脚本自身错误（exit 1）区分。
 if [ "$gate" = "PASS" ]; then
   exit 0
 else
