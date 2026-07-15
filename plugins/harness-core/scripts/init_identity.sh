@@ -87,9 +87,18 @@ stack_backend_http="$(get_yaml stack_backend_http)"
 stack_backend_lint="$(get_yaml stack_backend_lint)"
 stack_frontend="$(get_yaml stack_frontend)"
 
-# 顶层目录（用于模块结构 bullet）: 取对比路径首段
-pa_top="${compare_path_a%%/*}"
-pb_top="${compare_path_b%%/*}"
+# 顶层目录（用于模块结构 bullet）: 真实路径取首段 `%%/*`；
+# 占位符（值以 '<' 起始 · `<path/to/...>` 模式）或空值 → 原样透传、不截断（FR-4）。
+# 定死占位判定模式（spec v3 SH-3）: case 模式 '<'* 或空串命中占位/空值分支；
+#   边界 '<path'（以 '<' 起始但缺尾 '>'）亦按占位透传（AC-7 边界断言）。真实路径不含 '<'。
+top_seg() {
+  case "$1" in
+    ''|'<'*) printf '%s' "$1" ;;         # 空值 / 占位符: 原样透传（不做 %%/* 截断）
+    *)       printf '%s' "${1%%/*}" ;;   # 真实路径: 取首段（如 demo/src/x -> demo）
+  esac
+}
+pa_top="$(top_seg "$compare_path_a")"
+pb_top="$(top_seg "$compare_path_b")"
 
 # 前端栈尾巴（本仓为空则不输出）
 fe_tail=""

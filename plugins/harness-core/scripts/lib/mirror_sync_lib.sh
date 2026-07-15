@@ -14,6 +14,10 @@
 
 MIRROR_SYNC_PREFIX="[mirror-sync]"
 
+# 台账 schema 版本 sentinel（FR-8 · 字面量冻结 · 首行 # 注释行 · 条目行仍 key\thash）。
+# 读侧字符串等值判定：台账首行 != 本字面量（含缺失）即视为旧 schema（旧全文件哈希口径）。
+MIRROR_SYNC_LEDGER_SENTINEL="#ledger-schema=2-canonical"
+
 # ── STATE_DIR 根解析单一口径（内联兜底逐字同 lib/shell-utils.sh · 未 source shell-utils 时可用）──
 if ! type harness_state_root >/dev/null 2>&1; then
   harness_state_root() {
@@ -83,6 +87,39 @@ mirror_sync_hash() {
     shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
   else
     cksum "$1" 2>/dev/null | awk '{print $1"-"$2}'
+  fi
+}
+
+# ── canonical 哈希口径（FR-1 · 缺陷② 改1 · NG-6 上层包装 · 底层 mirror_sync_hash 回退链不动）──
+_mirror_hash_stdin() {
+  # 从 stdin 取稳定哈希（回退链同 mirror_sync_hash · 上层管道包装 · 不落中间临时文件）
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum 2>/dev/null | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 2>/dev/null | awk '{print $1}'
+  else
+    cksum 2>/dev/null | awk '{print $1"-"$2}'
+  fi
+}
+
+mirror_sync_canonical_hash() {
+  # $1 = 文件；echoes canonical 哈希（记录口径 == 比对口径 · FR-1）：
+  #   含 HARNESS:IDENTITY:START/END 标记的文件 → 剔除标记块之间内容后哈希（身份段机器再生不制造假"本地改动"）；
+  #   无标记块 → 退化为整文件哈希（mirror_sync_hash · 零回归 · AC-1）。
+  # 防御（阶段4 评审 S1）：含 START 但**无匹配 END** 的损坏文件 → awk 剔块会"无限吞"START 后全部内容
+  #   （损坏 semi 件 + START 后本地手改会被误判未改而 clobber）→ 保守回退整文件哈希
+  #   （任何差异都可见 · 宁误保护不误覆盖）。良构块行为零变化。
+  # 不可读/缺失 → 空（同 mirror_sync_hash 语义）。管道式实现、不落中间临时文件（AC-11）。
+  [ -r "$1" ] || return 0
+  if _mirror_has_identity "$1" && grep -q "HARNESS:IDENTITY:END" "$1" 2>/dev/null; then
+    awk '
+      /HARNESS:IDENTITY:START/ { print; _ms_skip=1; next }
+      /HARNESS:IDENTITY:END/   { _ms_skip=0; print; next }
+      _ms_skip { next }
+      { print }
+    ' "$1" 2>/dev/null | _mirror_hash_stdin
+  else
+    mirror_sync_hash "$1"
   fi
 }
 
@@ -156,9 +193,10 @@ _mirror_ledger_lookup() {
 }
 
 _mirror_record_current() {
-  # $1 = 镜像文件；$2 = ledger key；$3 = 新台账（追加）——记录镜像文件当前哈希
+  # $1 = 镜像文件；$2 = ledger key；$3 = 新台账（追加）——记录镜像文件 canonical 哈希
+  # （FR-1 · 记录口径 == 比对口径 · 身份段机器再生不改变基线）
   local dest="$1" key="$2" newl="$3" h=""
-  [ -f "$dest" ] && h="$(mirror_sync_hash "$dest")"
+  [ -f "$dest" ] && h="$(mirror_sync_canonical_hash "$dest")"
   printf '%s\t%s\n' "$key" "${h:-NA}" >> "$newl" 2>/dev/null || true
 }
 
@@ -237,11 +275,19 @@ _mirror_semi_backfill() {
 # ── 机器件/半定制件覆盖（T4/T5 · 台账本地改动保护 · 幂等）──
 _mirror_apply_overwrite() {
   # $1=权威源文件(f) $2=权威源根相对(rel) $3=action(machine|semi) $4=镜像根 $5=old_ledger $6=new_ledger $7=creport
+  #
+  # 判定链严格定死（spec §4 顶部 · 缺陷② 三改 + FR-8 迁移互不抵消依赖此顺序）：
+  #   ① src 可读性检查
+  #   ② identical-to-源 canonical 短路（FR-3 · 不依赖台账提交时序 → 消双轮撕裂误标 + 粘性保护逃逸）
+  #   ③ 保护比对（canonical 口径 · FR-1；命中记旧基线 led 跳过 · FR-2 粘性；
+  #      FR-8 迁移判定内嵌本步入口：旧 schema 台账 ∧ 该文件〔dest∨src〕含 IDENTITY 标记 → led 不作可信基线）
+  #   ④ 覆盖（记 canonical 基线）
   local f="$1" rel="$2" action="$3" mirror_root="$4" oldl="$5" newl="$6" creport="$7"
-  local key dest cur led
+  local key dest cur led migrating
   key="$(mirror_sync_dest_rel "$rel")"
   dest="$mirror_root/$key"
 
+  # ① src 可读性
   if [ ! -r "$f" ]; then
     MIRROR_SYNC_FAILED=1
     echo "src-unreadable: $rel" >> "$creport"
@@ -249,35 +295,54 @@ _mirror_apply_overwrite() {
     return
   fi
 
-  # 本地改动保护（FR-6 · 预期跳过、不计失败）：台账有记录 且 镜像现哈希 ≠ 台账 → 本地改过 → 不覆盖
+  # ② identical-to-源 canonical 短路：镜像现内容（canonical）已 == 权威源（canonical）→ 已是权威新态
+  #    → 记 canonical 基线、直接返回（不进保护分支、不重复 cp · 保幂等零写入）。
+  #    不依赖台账时序：dest↔源直比，从根消除双轮撕裂窗口误标（FR-3）；同时为 FR-2 粘性保护提供逃逸
+  #    （用户把本地文件改成与权威源一致 → 下轮此处命中 · 自动重记基线解除保护）。
+  if [ -f "$dest" ] && [ "$(mirror_sync_canonical_hash "$dest")" = "$(mirror_sync_canonical_hash "$f")" ]; then
+    _mirror_record_current "$dest" "$key" "$newl"
+    return
+  fi
+
+  # ③ 保护比对（canonical 口径 · FR-1/FR-2 · FR-8 迁移判定内嵌）
   if [ -f "$dest" ]; then
-    cur="$(mirror_sync_hash "$dest")"
+    cur="$(mirror_sync_canonical_hash "$dest")"
     led="$(_mirror_ledger_lookup "$oldl" "$key")"
-    if [ -n "$led" ] && [ -n "$cur" ] && [ "$cur" != "$led" ]; then
-      echo "local-modified-skip: $key（本地改动 · 保护性跳过 · 权威源较新未覆盖 · 请人工裁决）" >> "$creport"
-      printf '%s\t%s\n' "$key" "$cur" >> "$newl" 2>/dev/null || true   # 保留现哈希基线（下次仍保护）
+    # FR-8(2) 迁移判定（v3 判别收窄 · MF-2 方案 A）：旧 schema 台账（_MS_OLD_SCHEMA=1）
+    # 且 该文件（dest∨src 保守判 · 复用 _mirror_has_identity）含 IDENTITY 标记 →
+    # 其旧口径全文件哈希含身份段字节、与 canonical 不可比 → led 不作可信基线（视为该 key 尚无 canonical 基线）。
+    # 无标记文件旧口径 == canonical 完全可比 → led 照常可信、走常规粘性保护语义。
+    migrating=0
+    if [ "${_MS_OLD_SCHEMA:-0}" = "1" ] && { _mirror_has_identity "$dest" || _mirror_has_identity "$f"; }; then
+      migrating=1
+    fi
+    if [ "$migrating" = "0" ] && [ -n "$led" ] && [ -n "$cur" ] && [ "$cur" != "$led" ]; then
+      # FR-2 粘性保护：本地改动 → 不覆盖、记旧台账基线 led（非当前 cur · 与 L364-366 components 让路 _dled 同构）
+      # → 保护持续生效直至文件与权威源 canonical 一致（②短路自动解除）或人工清除台账条目。
+      echo "local-modified-skip: $key（本地改动 · 粘性保护 · 保留基线 · 权威源较新未覆盖 · 改成与权威源一致 或 人工清除台账条目以接受升级）" >> "$creport"
+      printf '%s\t%s\n' "$key" "$led" >> "$newl" 2>/dev/null || true
       return
+    fi
+    if [ "$migrating" = "1" ]; then
+      # FR-8(3) 迁移轮以权威源覆盖 dest ≠ 源的 IDENTITY 件（未②短路即 canonical 有别）→ 留痕（宁留痕不静默 · R-9）
+      echo "ledger-schema-migrated: $key" >> "$creport"
     fi
   fi
 
-  # 覆盖（内容已一致则零写入 · 幂等）
-  if [ -f "$dest" ] && cmp -s "$f" "$dest" 2>/dev/null; then
-    : # identical
+  # ④ 覆盖（记 canonical 基线）——到此 canonical 必有别（否则②已短路），恒需覆盖
+  mkdir -p "$(dirname "$dest")" 2>/dev/null
+  if [ "$action" = "semi" ] && _mirror_has_identity "$f"; then
+    if ! _mirror_semi_backfill "$f" "$dest" "$creport"; then
+      MIRROR_SYNC_FAILED=1
+      _mirror_record_current "$dest" "$key" "$newl"
+      return
+    fi
   else
-    mkdir -p "$(dirname "$dest")" 2>/dev/null
-    if [ "$action" = "semi" ] && _mirror_has_identity "$f"; then
-      if ! _mirror_semi_backfill "$f" "$dest" "$creport"; then
-        MIRROR_SYNC_FAILED=1
-        _mirror_record_current "$dest" "$key" "$newl"
-        return
-      fi
-    else
-      if ! cp -p "$f" "$dest" 2>/dev/null; then
-        MIRROR_SYNC_FAILED=1
-        echo "cp-failed: $key" >> "$creport"
-        _mirror_record_current "$dest" "$key" "$newl"
-        return
-      fi
+    if ! cp -p "$f" "$dest" 2>/dev/null; then
+      MIRROR_SYNC_FAILED=1
+      echo "cp-failed: $key" >> "$creport"
+      _mirror_record_current "$dest" "$key" "$newl"
+      return
     fi
   fi
   _mirror_record_current "$dest" "$key" "$newl"
@@ -314,8 +379,8 @@ _mirror_emit_cascade() {
     printf -- '---\n\n'
     printf '# 待处理级联评估 · 定制件上游模板变化\n\n'
     printf '定制规则 `%s` 的权威源模板已变化（mirror-sync 检测 · 版本升级传导）。\n\n' "$rule"
-    printf '- 本定制件**未被自动覆盖**（custom 永不覆盖策略）。\n'
-    printf '- 请人工评估：是否需要把上游模板变更级联到本地定制版本；评估后把本文件 frontmatter `status` 改为 `resolved`。\n'
+    printf -- '- 本定制件**未被自动覆盖**（custom 永不覆盖策略）。\n'
+    printf -- '- 请人工评估：是否需要把上游模板变更级联到本地定制版本；评估后把本文件 frontmatter `status` 改为 `resolved`。\n'
   } > "$f" 2>/dev/null || { echo "cascade-write-failed: $rule" >> "$creport"; return 0; }
   echo "cascade-emitted: $rule（待处理级联评估已产出 → $f）" >> "$creport"
 }
@@ -335,6 +400,20 @@ mirror_sync_run() {
   local old_ledger="$sdir/mirror_sync_hash_ledger"
   local new_ledger
   new_ledger="$(mktemp "$sdir/.mirror_ledger.XXXXXX" 2>/dev/null)" || { MIRROR_SYNC_FAILED=1; return 1; }
+
+  # FR-8(1) 写侧：新台账首行写 schema 版本 sentinel（mktemp 建 temp 后、任何条目追加前立即写 · SH-5 位序定死）。
+  printf '%s\n' "$MIRROR_SYNC_LEDGER_SENTINEL" > "$new_ledger" 2>/dev/null || true
+
+  # FR-8(2) 读侧：判定旧台账 schema（字符串等值 · 首行 != 当前 sentinel〔含缺失〕即旧 schema · 免数值解析）。
+  # 旧 schema 下 IDENTITY 件旧口径不可比 → _mirror_apply_overwrite 迁移判定（③）消费本全局量。
+  local _old_first=""
+  [ -f "$old_ledger" ] && _old_first="$(head -1 "$old_ledger" 2>/dev/null)"
+  if [ "$_old_first" = "$MIRROR_SYNC_LEDGER_SENTINEL" ]; then
+    _MS_OLD_SCHEMA=0
+  else
+    _MS_OLD_SCHEMA=1
+  fi
+
   local conflict_report="$sdir/mirror_sync_conflicts.log"
   : > "$conflict_report" 2>/dev/null || true
 
