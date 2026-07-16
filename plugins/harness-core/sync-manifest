@@ -36,6 +36,18 @@ machine  _template/_TEMPLATE/*
 #   wiki产物数据规范.md 开发流程操作教训.md README.md
 machine  rules/*
 
+# ── config（machine 类 · 覆盖刷新 · fix-sync-manifest-config-gap-20260716）──
+# config/ = 机器可读权威表目录（当前 model_tiers.tsv：阶段→默认模型档单源），供宿主侧委派守护
+#   hook pretool_agent_delegation_guard.sh 读 model_tiers.tsv 做「按阶段默认档降档校验」（deny 降档漂移）。
+#   guard 候选② `$root_dir/.harness/config/model_tiers.tsv` 需由 mirror 铺到消费方，故此表须 machine 覆盖
+#   语义（权威单源、消费方不定制），每会话以权威源覆盖镜像（受哈希台账本地改动保护）。
+# 同族第二次复发留痕：parent card fix-consumer-harness-config-gap-20260714（HARNESS_CONFIG 模板，见文末
+#   opt-out 区）为第一次；本卡 fix-sync-manifest-config-gap-20260716 为第二次——均为「新增 machine 可消费
+#   产物时忘了扩 sync-manifest → 消费方永不拿到 → 宿主侧功能 fail-open 空转」。教训：**新增任何 machine
+#   可消费产物（宿主 hook/脚本会读的权威表/组件）必须同步在本 manifest 扩一条对应 glob**，否则镜像不铺、
+#   消费方缺文件、依赖它的守护静默空转。config/* 子树整体纳入（非精确单文件），防未来新增 config 表第三次复发。
+machine  config/*
+
 # ── 半定制件（semi · 覆盖 + 身份回填）──
 # agents/* 全归 semi：含 HARNESS:IDENTITY 标记块的（application-owner.md）覆盖后重跑 init_identity 回填身份段；
 # 无标记块的（reviewer/generator/strategist/entropy/README）semi 处理器等价纯覆盖（无身份段可回填）。
