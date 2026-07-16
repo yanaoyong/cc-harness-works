@@ -48,6 +48,26 @@ machine  rules/*
 #   消费方缺文件、依赖它的守护静默空转。config/* 子树整体纳入（非精确单文件），防未来新增 config 表第三次复发。
 machine  config/*
 
+# ── wiki-background/harness-lessons（machine 类 · 覆盖刷新 · feat-memory-distillation-to-plugin-20260716）──
+# harness-lessons/ = 背景库 corpus（从 MEMORY 蒸馏的跨会话工程教训 8 篇 md + index.md），供设计/评审阶段
+#   子 Agent 经 wiki-query --wiki .harness/wiki-background/harness-lessons/ 旁路检索。权威源单源、消费方不
+#   定制，故 machine 覆盖语义，每会话以权威源覆盖镜像（受哈希台账本地改动保护）。
+# 镜像语义：plugin 根相对 wiki-background/harness-lessons/X → 消费方 .harness/wiki-background/harness-lessons/X
+#   （dest_rel 默认映射）。case 语义下末尾 `*` 匹配含 `/`，命中该目录下全部文件；scan_roots 取首 `*` 前段
+#   = wiki-background/harness-lessons 作遍历根，find -type f 递归枚举全部 corpus 文件。
+# ⚠ glob 精确到 harness-lessons/ 子目录（非泛 `wiki-background/*`）的原因（实测定论 · 非保守选择）：
+#   mirror_sync_classify/scan_roots 用 `set -- $line`（无引号）解析 manifest 行 → 该 glob 会先经**宿主 cwd
+#   路径展开（pathname expansion）**。宿主 hook（session_start_mirror_sync.sh L42）`cd $TOP`（仓库根）后运行，
+#   而仓库根**存在** wiki-background/ 目录（C 源背景库约定：research-<topic> 语料落仓库根 wiki-background/）→
+#   `wiki-background/*` 会被展开成 `wiki-background/README.md ...` 实文件、glob 退化为具体文件名 → 嵌套
+#   corpus 路径 wiki-background/harness-lessons/*.md 分类 miss → **corpus 永不铺到消费方**（正是本卡要防的 FR 失败）。
+#   既有全部 machine glob 前缀（components/scripts/skills/rules/agents/config…）在仓库根**均不存在**同名目录，
+#   故不被展开——设计隐含依赖「glob 前缀不与宿主 cwd 目录撞名」。harness-lessons/ 前缀 harness 独占、仓库根
+#   无此子目录，故不被展开、分类稳定命中。（根治需在 lib 加 `set -f` 禁展开，属机制层、不在本卡范围。）
+# 同族第三次复发防线（承 config/* §）：未来新增背景库 corpus 目录须同步在本 manifest 扩一条对应 glob
+#   （同理精确到该 corpus 子目录避 cwd 撞名），否则镜像不铺、消费方缺 corpus、依赖它的旁路检索静默空转。
+machine  wiki-background/harness-lessons/*
+
 # ── 半定制件（semi · 覆盖 + 身份回填）──
 # agents/* 全归 semi：含 HARNESS:IDENTITY 标记块的（application-owner.md）覆盖后重跑 init_identity 回填身份段；
 # 无标记块的（reviewer/generator/strategist/entropy/README）semi 处理器等价纯覆盖（无身份段可回填）。

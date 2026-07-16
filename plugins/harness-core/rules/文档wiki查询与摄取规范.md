@@ -113,6 +113,10 @@ updated: 2026-06-22
 | WK-B1 | 查询前**先选 corpus 再查**：项目类问题路由 `wiki/`，设计/评审吸收外部先验路由 `wiki-background/<c>/`（`--wiki` 路径均为**仓库根相对路径** · 承接 M3.2 LOW-1 澄清）| MUST 人工 | corpus 路由核对 |
 | WK-B2 | **缺位优雅降级（可用性底线）**：背景 corpus 缺位/后到时，设计/评审阶段**照常推进，不报错、不阻断**（无 `wiki-background/<c>/` 则跳过背景查询）；不臆造背景经验 | MUST 人工 | ≥1 次实测设计/评审阶段无背景库可正常完成（QAS-A4）|
 
+<!-- HARNESS:LESSON:START -->
+> **消费方镜像 corpus 路由（策展经验库 · 随插件镜像分发）**：消费方项目须用 `--wiki .harness/wiki-background/harness-lessons/` 查询随插件镜像分发的策展经验库（跨项目可泛化的工程教训脱敏策展集）。本仓权威源在 `plugins/harness-core/wiki-background/harness-lessons/`，经 sync-manifest 镜像至消费方 `.harness/wiki-background/harness-lessons/`（消费方查询用 `.harness/` 前缀相对路径）。该 corpus 属 R-015 设计/评审阶段吸收外部先验经验的背景库范畴，消费须遵 WK-B3/B4 批判性平衡吸收三要点；缺位时按 WK-B2 优雅降级不阻断。仅新增路由说明，不改既有 WK-B1/B2 语义。
+<!-- HARNESS:LESSON:END -->
+
 ### 5.2 批判性平衡吸收三要点（语义占位 · 操作机制留 O-001）
 
 > 承接 R-015 §2.1.1 + QAS-A5。设计/评审阶段消费背景经验时，须**批判性平衡吸收**（防"基于不适用先验作答"的假阳）。**本轮为语义层可对照检查纪律，操作机制（产物项/评审清单项/SOP）留 O-001/O-004 后续卡**。

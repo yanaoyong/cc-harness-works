@@ -254,6 +254,14 @@ spec: docs/stage-01-Harness体系建设/02-体系设计/04-编排中枢-Applicat
 
 **循环上限**：每 M 阶段评审 ≤3 轮；M3 三子阶段各 ≤2 轮（任一子阶段>2 轮或 M3 累计返工>3 次→升级人工）。
 
+<!-- HARNESS:LESSON:START -->
+**M 阶段委派模型（产出型整段可托 strategist / 含中途人工对话留 Owner+人）**：
+
+- **产出型 M 阶段 → 整段执行可完整委派 strategist**：某 M 阶段 SOP 里**无"中途要问人"的交互步**时（M1 需求挖掘 / M2 范围圈定 / M3.1~3.3 / M4 / M5 均属产出型，HITL 只在出口门禁 HITL-Mx + reviewer）→ **一次委派 strategist 跑完 SOP 出 v1** 即可。
+- **含中途人工对话采集 → 交互部分留 Owner+人、其余委派**：典型是 **M0 vision-clarification 的"五段对话采集"**（问题 / 不做 / 成功标准 / 利益相关方 / 时间盒）——子 Agent 经 Task 启动是**一次性跑完返回、不能中途停下跟人对话**，故 **Owner 必须先跟人采集完再把结果喂进 strategist 委派**，或 Owner 自己承担采集 + 起草。
+- **恒不委派**：Owner 编排决策（触发模式路由 / 何时委派推进）+ 全部 HITL 人工确认（触发模式选择 / HITL-M0/M1/… / M0.5 进入决策 / 模式 E REOPEN）恒留 Owner+人；**触发模式必须显式声明 / HITL 确认，Owner 不得自动推断**。
+<!-- HARNESS:LESSON:END -->
+
 **M0.5 必经闸（钉死措辞 · 不可弱化）**：
 
 - M0.5 = M0↔M1 间的**独立 substate**（独立阶段位 · **非 M0 出口子阶段**）；状态机用独立 `m0_5_*` 字段族承载。
