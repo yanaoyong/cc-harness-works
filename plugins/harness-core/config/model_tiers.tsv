@@ -1,0 +1,15 @@
+# model_tiers.tsv — 阶段→默认模型档 机器可读单源（权威源）
+# 权威源地位：本文件为「阶段→默认档」映射的机器可读单一事实来源（AC-5.1/5.3）。
+#   application-owner.md 模块四「模型档默认值」表为人读展示，值须与本文件逐阶段一致（AC-5.4 守护测试强制）。
+# 消费方：pretool_agent_delegation_guard.sh（T-4 对表校验）读取本表对委派 model 参数做降档校验。
+# 来源卡：chore-hook-governance-hardening-20260715（T-5 档位表单源化）。
+# 格式：一行一阶段 `<stage>\t<tier>`，tab 分隔，覆盖阶段 1-9；awk/read 纯 bash 无依赖可解析。
+1	opus
+2	opus
+3	opus
+4	opus
+5	sonnet
+6	sonnet
+7	haiku
+8	haiku
+9	haiku

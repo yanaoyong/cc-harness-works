@@ -368,7 +368,9 @@ emit_main_list() {
   # P-5 保留行 2：单活跃 10 阶段实例且阶段 <3 → 禁编辑业务代码（next_stage 沿用基线：活跃态 state 非 PASSED → next_stage = 当前阶段）
   if [ "$total_active" -eq 1 ] && [ "$single_group" = "ten-stage" ]; then
     local stage_num
-    stage_num="$(printf '%s' "$single_item" | sed -n 's/.*阶段 \([0-9][0-9]*\).*/\1/p')"
+    # 阶段号解析口径单源（chore-hook-governance-hardening-20260715 · T-2 · AC-2.1）：
+    # 抽为 _upi_item_stage，与 emit_stage_reconcile 快照第2列同源，消除双解析漂移。
+    stage_num="$(_upi_item_stage "$single_item")"
     if [ -n "$stage_num" ] && [ "$stage_num" -lt 3 ]; then
       printf '%s\n' "      · 禁止：阶段 3（编码实现）开始前编辑 demo/**、harnessdemo/**、src/** 业务代码（即：阶段 2 评审通过后方可编码 · 当前 ${single_item} · ${single_state}）"
     fi
@@ -556,14 +558,26 @@ compute_water_sum() {
   printf '%s' "$sum"
 }
 
-# ---------- 分段建议（T-A2 · 三条件缺一不触发 · 旁路提示恒 exit 0）----------
-# 允许切点白名单仅 2 处：2→3（HITL-2 决议后）/ 6→7（阶段6 闭合后）（AC-A2-1）。
-# 阈值 env 可调（AC-A2-2 · 禁写死）：HARNESS_SEGMENT_T2 默认 160000 / HARNESS_SEGMENT_T6 默认 200000；
-#   env 未设/空/非数字 → 回退默认。
-# 三条件（AC-A2-3）：水位≥对应阈值 ∧ 活跃卡恰处允许边界 ∧ 该边界事件发生在本会话内——
-#   后两者由 stage_progress_<sid> 记号承载（方案 P · summary_flip_guard 放行路径落 · 本会话内 summary 阶段翻牌）。
-#   纯查询 / 未推卡会话无该记号 → 零建议（AC-A2-4）。
-# 单次去重：同一边界事件（卡+边界+记号时间戳）仅建议一次（keyfile segment_suggest_lastfire_<sid>）。
+# ---------- 分段建议 + T4 事后对账（chore-hook-governance-hardening-20260715 · T-2/T-3 · 旁路恒 exit 0）----------
+# 【背景 · 失效②退役寄生记号】原 T-A2「方案 P」以 stage_progress_<sid> 记号承载「本会话内阶段翻牌」信号，
+#   记号由 pretool_summary_flip_guard.sh 放行路径的 _seg_write_marker 副作用写入——该副作用寄生在 T4 翻牌门
+#   hook 内，一旦 T4 门被 Bash `sed -i` 绕过（门只注册 Edit|Write），记号一并静默失效 → 分段建议永不触发。
+#   本卡改为「读盘阶段号快照差分对账」：不再依赖任何 hook 副作用记号，任何通道（Edit/sed/子Agent/跨会话）
+#   改 summary 都能在下一轮读盘被对出。寄生段（_seg_detect_and_mark/_seg_write_marker/_seg_has_phase/
+#   SEG_FLIP_RE_2/6 及主流程调用）已在 pretool_summary_flip_guard.sh 内删除（AC-2.6 · 门禁判定式一字不动）。
+#
+# 【T-2 分段建议 · 快照差分】每轮为各活跃 ten-stage 卡落阶段快照 last_seen_stage_<sid>.log，
+#   冻结三列 schema `<card_dir>\t<当前阶段号>\t<已PASSED的1/3/5阶段集csv(可空)>`
+#   （第2列供 T-2 边界差分、第3列供 T-3 翻牌差分 · AC-2.1）。当前阶段号解析复用主清单 emit_main_list 同一口径
+#   （_upi_item_stage · 消除双解析漂移）；第3列用与 T4 翻牌门同族的行匹配（UPI_FLIP_RE_1/3/5 复刻 FLIP_RE_1/3/5）判定。
+#   读写次序定死：每轮先读旧快照对账（T-2 边界 + T-3 报警），后覆盖写新快照——写先于比较则跨越永不可测。
+#   允许切点白名单仅 2 处：2→3（HITL-2 决议后）/ 6→7（阶段6 闭合后）（AC-2.2）。阈值 env 可调（AC-2.3 · 禁写死）：
+#   HARNESS_SEGMENT_T2 默认 160000 / HARNESS_SEGMENT_T6 默认 200000；env 未设/空/非数字 → 回退默认。
+#   边界触发：某活跃卡当前阶段号相对上轮快照 ≤2→≥3 / ≤6→≥7 ∧ 水位≥对应阈值 → 注入分段建议；多卡同轮
+#   跨越逐卡各注入一次（AC-2.2 · 去重键 card|boundary 天然按卡隔离）。首轮/纯查询/未推卡：无旧快照基线 → 零建议（AC-2.5）。
+#   单次去重（AC-2.4）：同一边界事件（卡+边界）仅建议一次（keyfile segment_suggest_fired_<sid>）。
+#   损坏安全侧（AC-2.8）：快照缺失/某卡行缺失/阶段号非数字/col3损坏 → 视同无基线，本轮该卡不触发任何
+#   建议/报警、仅重建快照——不得把损坏值当 0 或 ≤2（否则与当前 ≥3 构成虚假跨越 → 误注入）。
 _seg_threshold_default() { case "$1" in 2to3) printf '160000' ;; 6to7) printf '200000' ;; *) printf '' ;; esac; }
 _seg_threshold_env() {
   # $1=边界；返回该边界阈值（env 覆写 · 非数字回退默认）
@@ -577,36 +591,163 @@ _seg_threshold_env() {
   case "$v" in ''|*[!0-9]*) printf '%s' "$def" ;; *) printf '%s' "$v" ;; esac
 }
 
-emit_segment_suggest() {
-  # $1=water_sum(原始 token · 空表示水位不可得) $2=state_dir $3=sid
-  local wsum="$1" sdir="$2" sid="$3" marker last card boundary mts thr key kf lastkey
-  [ -n "$wsum" ] || return 0                          # 水位不可得 → 不建议（三条件之一缺）
-  case "$wsum" in ''|*[!0-9]*) return 0 ;; esac
-  marker="$sdir/stage_progress_${sid}.log"
-  [ -r "$marker" ] || return 0                        # 本会话无阶段边界记号 → 零建议（AC-A2-4）
-  # 最近一条边界记号：<ISO8601>\t<card_dir>\t<boundary(2to3|6to7)>
-  last="$(tail -n 1 "$marker" 2>/dev/null || true)"
-  [ -n "$last" ] || return 0
-  mts="$(printf '%s' "$last" | awk -F'\t' '{print $1}')"
-  card="$(printf '%s' "$last" | awk -F'\t' '{print $2}')"
-  boundary="$(printf '%s' "$last" | awk -F'\t' '{print $3}')"
-  case "$boundary" in 2to3|6to7) ;; *) return 0 ;; esac   # 白名单外边界 → 不建议（AC-A2-1）
+# 门族行匹配正则复刻（与 pretool_summary_flip_guard.sh FLIP_RE_1/3/5 同族 · AC-2.1 第3列 / AC-3.1 信号①）。
+# 复刻而非共享 source：两 hook 无共享 source 层，此为 UserPromptSubmit 读盘侧独立副本（改门族正则须两处同步）。
+UPI_FLIP_RE_1='\|[[:space:]]*1[[:space:]]+[^|]*\|[[:space:]]*PASSED([[:space:]]|\|)'
+UPI_FLIP_RE_3='\|[[:space:]]*3[[:space:]]+[^|]*\|[[:space:]]*PASSED([[:space:]]|\|)'
+UPI_FLIP_RE_5='\|[[:space:]]*5[[:space:]]+[^|]*\|[[:space:]]*PASSED([[:space:]]|\|)'
+
+_upi_item_stage() {
+  # 复用 emit_main_list 同一口径从 brief item 提取阶段号（AC-2.1 · 单源消除双解析漂移 · 与 L371 同 sed 式）
+  printf '%s' "$1" | sed -n 's/.*阶段 \([0-9][0-9]*\).*/\1/p'
+}
+_upi_item_card() {
+  # 从 brief item 提取卡目录名（首个 ` · ` 之前 · = list_flows A_name / 目录 basename）
+  local it="$1"; printf '%s' "${it%% · *}"
+}
+_upi_phase_passed_file() {
+  # $1=summary文件 $2=阶段(1/3/5)；文件内命中该阶段 PASSED 行返回 0（门族行匹配 · AC-2.1/AC-3.1 信号①）
+  local f="$1" ph="$2" re
+  case "$ph" in
+    1) re="$UPI_FLIP_RE_1" ;;
+    3) re="$UPI_FLIP_RE_3" ;;
+    5) re="$UPI_FLIP_RE_5" ;;
+    *) return 1 ;;
+  esac
+  [ -r "$f" ] || return 1
+  grep -qE "$re" "$f" 2>/dev/null
+}
+_upi_passed_set_csv() {
+  # $1=summary文件；输出已 PASSED 的 1/3/5 阶段集 csv（如 "1,3"；空则空串）
+  local f="$1" ph out=""
+  for ph in 1 3 5; do
+    if _upi_phase_passed_file "$f" "$ph"; then out="${out:+$out,}$ph"; fi
+  done
+  printf '%s' "$out"
+}
+_upi_csv_has() {
+  # $1=csv 集 $2=元素；集内含该元素返回 0
+  case ",${1}," in *",${2},"*) return 0 ;; *) return 1 ;; esac
+}
+_upi_col3_valid() {
+  # col3 合法性（AC-2.8）：空 或 元素∈{1,3,5} 逗号分隔（形如 1 / 1,3 / 1,3,5）；损坏 → 视同无基线
+  case "$1" in
+    '') return 0 ;;
+    *[!135,]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+_upi_active_brief() {
+  # $1=root；取 --active --format=brief（复用 emit_main_list 同链定位 _locate_script）；失败/缺失返回 1
+  local root="$1" lf brief
+  lf="$(_locate_script list_flows.sh "$root" || true)"
+  [ -n "$lf" ] && [ -f "$lf" ] || return 1
+  brief="$(bash "$lf" --active --format=brief 2>/dev/null)" || return 1
+  printf '%s' "$brief"
+}
+
+_seg_maybe_suggest() {
+  # $1=card $2=old_stage(数字) $3=new_stage(数字) $4=wsum(数字) $5=keyfile
+  # 边界判定 + 水位阈值 + 去重 → 注入分段建议（文案/阈值 env 覆写/去重语义与退役前 emit_segment_suggest 一致）
+  local card="$1" olds="$2" news="$3" wsum="$4" kf="$5" boundary="" thr key wk stage_label
+  if [ "$olds" -le 2 ] && [ "$news" -ge 3 ]; then
+    boundary="2to3"
+  elif [ "$olds" -le 6 ] && [ "$news" -ge 7 ]; then
+    boundary="6to7"
+  else
+    return 0
+  fi
   thr="$(_seg_threshold_env "$boundary")"
   case "$thr" in ''|*[!0-9]*) return 0 ;; esac
-  [ "$wsum" -ge "$thr" ] || return 0                  # 水位未达阈值 → 不建议（三条件之一缺）
-  # 单次去重（同一边界事件仅建议一次）
-  key="${card}|${boundary}|${mts}"
-  kf="$sdir/segment_suggest_lastfire_${sid}"
-  lastkey="$(cat "$kf" 2>/dev/null || true)"
-  [ "$lastkey" = "$key" ] && return 0
-  printf '%s\n' "$key" > "$kf" 2>/dev/null || true
-  local wk stage
+  [ "$wsum" -ge "$thr" ] || return 0                  # 水位未达阈值 → 不建议
+  # 单次去重（AC-2.4 · 卡+边界 · 多卡各自隔离 · keyfile 一键一行）
+  key="${card}|${boundary}"
+  if [ -r "$kf" ] && grep -qxF "$key" "$kf" 2>/dev/null; then return 0; fi
+  printf '%s\n' "$key" >> "$kf" 2>/dev/null || true
   wk=$(( wsum / 1000 ))
-  case "$boundary" in 2to3) stage="阶段2→3（HITL-2 决议后）" ;; 6to7) stage="阶段6→7（阶段6 闭合后）" ;; esac
+  case "$boundary" in 2to3) stage_label="阶段2→3（HITL-2 决议后）" ;; 6to7) stage_label="阶段6→7（阶段6 闭合后）" ;; esac
   printf '\n'
-  printf '%s\n' "  ✂️ [harness:segment_suggest] 分段建议（旁路·可无视）：当前上下文水位≈${wk}k 已达阈值 $(( thr / 1000 ))k，且本会话刚跨越 ${stage} 边界（卡 ${card}）。"
+  printf '%s\n' "  ✂️ [harness:segment_suggest] 分段建议（旁路·可无视）：当前上下文水位≈${wk}k 已达阈值 $(( thr / 1000 ))k，且本会话刚跨越 ${stage_label} 边界（卡 ${card}）。"
   printf '%s\n' "     建议在此阶段边界分段续跑（/clear 同窗优先于新窗口，二者均优于 /compact）以省主循环缓存成本——见开发流程规范 DF-017。"
   printf '%s\n' "     采纳则 Owner 先写交接哨兵（source lib 后 \`harness_write_segment_handoff \"${card}\" \"<下一步阶段>\" \"<一句交接注>\"\`），/clear 后新会话按启动序列自动续推该卡；注意授权台账按 sid 隔离，切前授权失效需切后重授。"
+}
+
+_t4_maybe_alarm() {
+  # $1=card $2=cur_set(当前PASSED的1/3/5 csv) $3=old_set(基线PASSED csv) $4=deleg台账
+  # T-3 双信号（AC-3.1）：①当前阶段行 PASSED（cur_set 内）②不在基线第3列（本会话内翻牌 · 覆盖 sed 只翻表行
+  #   不移动阶段头字段的部分翻牌）。双信号成立 ∧ 台账可读 ∧ 无同卡 generator 记录 → 报警（只曝光不 deny）。
+  local card="$1" cur="$2" old="$3" deleg="$4" ph newly=""
+  for ph in 1 3 5; do
+    if _upi_csv_has "$cur" "$ph" && ! _upi_csv_has "$old" "$ph"; then
+      newly="${newly:+$newly,}$ph"
+    fi
+  done
+  [ -n "$newly" ] || return 0                         # 无本会话内新翻牌 → 不报警（AC-3.2 跨会话既有 PASSED 不误报）
+  # 台账缺失/不可读 → fail-open 不报警（AC-3.4）；可读且有同卡 generator 记录 → 不报警（AC-3.3）；无记录 → 报警（AC-3.1）
+  [ -r "$deleg" ] || return 0
+  if awk -F'\t' -v c="$card" '($2 ~ /generator/) && ($4 == c){f=1} END{exit f?0:1}' "$deleg" 2>/dev/null; then
+    return 0
+  fi
+  printf '%s\n' "  ⚠️ [harness:t4_reconcile] 事后对账（软兜底·只曝光不阻断）：卡 ${card} 阶段 ${newly} 本会话内翻 PASSED，但委派台账无同卡 generator 记录（疑似绕过 T4 翻牌门 / Owner inline 逃逸）。建议：经 Agent 委派 generator 补出该阶段产出与证据后再续推（DF-015）。"
+}
+
+emit_stage_reconcile() {
+  # $1=water_sum(原始token·空=水位不可得) $2=state_dir $3=sid $4=changes_dir $5=root
+  # T-2 分段建议（读盘快照差分）+ T-3 T4 事后对账报警（双信号）；旁路 · 任何失败均不改主注入退出码（AC-2.7/AC-3.4）。
+  local wsum="$1" sdir="$2" sid="$3" changes_dir="$4" root="$5"
+  local snapf="$sdir/last_seen_stage_${sid}.log" kf="$sdir/segment_suggest_fired_${sid}"
+  local deleg="$sdir/delegations_${sid}.log"
+  local brief old_snap new_snap="" line item one card stage sumf cur_set old_line old_stage old_set baseline_ok
+
+  brief="$(_upi_active_brief "$root" || true)"
+  # brief 不可得（list_flows 缺/失败）或无活跃卡 → 保留旧快照基线、跳过本轮对账（AC-2.7 fail-open）
+  [ -n "$brief" ] || return 0
+  # 先读旧快照全文入变量（AC-2.1 读写次序：先读后写；后续比对只读此变量，绝不读正在写的文件）
+  old_snap="$(cat "$snapf" 2>/dev/null || true)"
+
+  # 遍历活跃 ten-stage 卡（brief 行 `ten-stage[STATE]: item / item`；--active 已排除 PASSED 卡）
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    case "$line" in ten-stage\[*) ;; *) continue ;; esac
+    item="${line#*]: }"
+    while IFS= read -r one; do
+      [ -z "$one" ] && continue
+      card="$(_upi_item_card "$one")"
+      stage="$(_upi_item_stage "$one")"
+      [ -n "$card" ] || continue
+      case "$stage" in ''|*[!0-9]*) stage="" ;; esac      # 当前阶段号非数字 → 记空（不参与边界差分）
+      sumf="$changes_dir/$card/summary.md"
+      cur_set="$(_upi_passed_set_csv "$sumf")"
+
+      # 取该卡旧快照行（从已读入变量 · 不触盘）；AC-2.8 损坏安全侧：col2 须数字、col3 须合法集，否则视同无基线
+      old_line="$(printf '%s\n' "$old_snap" | awk -F'\t' -v c="$card" '$1==c{print; exit}' 2>/dev/null || true)"
+      old_stage=""; old_set=""; baseline_ok=0
+      if [ -n "$old_line" ]; then
+        old_stage="$(printf '%s' "$old_line" | awk -F'\t' '{print $2}')"
+        old_set="$(printf '%s' "$old_line" | awk -F'\t' '{print $3}')"
+        case "$old_stage" in ''|*[!0-9]*) old_stage="" ;; esac
+        if [ -n "$old_stage" ] && _upi_col3_valid "$old_set"; then baseline_ok=1; fi
+      fi
+
+      # T-3 事后对账报警（先曝光 · 双信号 · 仅有效基线；无基线=首轮不报警 AC-3.2）
+      if [ "$baseline_ok" = "1" ]; then
+        _t4_maybe_alarm "$card" "$cur_set" "$old_set" "$deleg"
+      fi
+      # T-2 边界跨越（仅有效基线 + 当前阶段号可用 + 水位可得 · AC-2.7 水位不可得不建议）
+      if [ "$baseline_ok" = "1" ] && [ -n "$stage" ] && [ -n "$wsum" ]; then
+        case "$wsum" in ''|*[!0-9]*) : ;; *) _seg_maybe_suggest "$card" "$old_stage" "$stage" "$wsum" "$kf" ;; esac
+      fi
+
+      # 累积新快照行（AC-2.1 冻结三列 schema · 真实 TAB 分隔）
+      new_snap="${new_snap}${card}"$'\t'"${stage}"$'\t'"${cur_set}"$'\n'
+    done < <(printf '%s\n' "$item" | awk '{gsub(/ \/ /, "\n"); print}')
+  done <<< "$brief"
+
+  # 后覆盖写新快照（AC-2.1 读写次序：写在所有比对之后 · 写失败静默 fail-open）
+  mkdir -p "$sdir" 2>/dev/null || return 0
+  [ -f "$sdir/.gitignore" ] || printf '*\n' > "$sdir/.gitignore" 2>/dev/null || true
+  printf '%s' "$new_snap" > "$snapf" 2>/dev/null || true
 }
 
 # ---------- 主流程 ----------
@@ -687,8 +828,9 @@ main() {
   emit_actions
   printf '\n'
   emit_wiki_nudge
-  # 分段建议（T-A2 · 三条件缺一不触发 · 旁路提示 · 恒 exit 0）
-  emit_segment_suggest "$_water" "$_state_dir" "$_sid"
+  # 分段建议（T-2）+ T4 事后对账报警（T-3）· 读盘快照差分对账 · 旁路 · 恒 exit 0
+  # （chore-hook-governance-hardening-20260715 · 退役寄生记号 stage_progress，改快照 last_seen_stage）
+  emit_stage_reconcile "$_water" "$_state_dir" "$_sid" "$changes_dir" "$root"
   # 兜底补注入置于块末（哨兵缺失时 · 一次性落哨兵防每轮重复）
   if [ "$_contract_missing" = "1" ]; then
     emit_contract_fallback "$root" "$_sentinel"

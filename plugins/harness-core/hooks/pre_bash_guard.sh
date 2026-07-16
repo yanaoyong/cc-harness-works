@@ -32,9 +32,13 @@ IFS= read -r -d '' payload || true
 # 若不纳入会被此处提前放行、绕过下方 merge 授权硬门。
 # 注：`stage7_push` 关键词纳入粗筛（feat-stage-exec-scripts T2′）——`bash .harness/scripts/stage7_push.sh …`
 # 既不含 `git` 也不含 `gh` 子串，若不纳入会被此处提前放行、绕过下方 T2 push 授权硬门（本卡核心缺口）。
+# 注：`summary.md` 关键词纳入粗筛（chore-hook-governance-hardening-20260715 · T-1 · AC-1.1）——文本编辑
+# summary.md 的命令（sed -i/重定向/tee/cp/mv…）既不含上列关键词也不含 `git`，若不纳入会被此处提前放行、
+# 绕过下方规则 C 的 summary.md 治理硬门。**不含 `summary.md` 子串的 payload 照旧零外部子进程立即放行**
+# （AC-1.1 快速路径零回归：仅在既有关键词并集**追加** summary.md，其余关键词与短路语义不变、性能预算不动）。
 if [[ "$payload" != *git* && "$payload" != *gh* && "$payload" != *rm* && "$payload" != *sudo* \
    && "$payload" != *mkfs* && "$payload" != *chmod* && "$payload" != *':()'* \
-   && "$payload" != *stage7_push* && "$payload" != */dev/sd* ]]; then
+   && "$payload" != *stage7_push* && "$payload" != *summary.md* && "$payload" != */dev/sd* ]]; then
   exit 0
 fi
 
@@ -52,6 +56,61 @@ fi
 cmd_lstrip="${cmd#"${cmd%%[![:space:]]*}"}"
 if [[ "$cmd_lstrip" == 'HARNESS_GIT_GUARD_BYPASS=1 '* ]]; then
   exit 0
+fi
+
+# ---- 规则 C：summary.md 文本编辑拦截（chore-hook-governance-hardening-20260715 · T-1 · AC-1.2/1.3）----
+# 缺口（失效①）：T4 翻牌门 pretool_summary_flip_guard.sh 只注册 PreToolUse(Edit|Write|MultiEdit)、对 Bash
+#   不触发 → `sed -i` 经 Bash 通道翻 summary.md 阶段位，翻牌门整个不在场。本规则把 summary.md 写入治理从
+#   「按工具名」补全为「按文件效果」：Bash 用文本编辑动词写 summary.md 一律 deny。
+# 判定轴（UQ-5）= 文本编辑动词的**写入目标**为 summary.md（非「命令提及 summary.md」）——读类（含
+#   `cat .../summary.md > /tmp/x` 读→转存到非 summary 目标）放行；解释器内联（python -c/ruby -e/node -e/
+#   perl -e|-i）无法静态区分读写 → 保守 fail-closed deny（含纯读，与 UQ-5 保守口径统一）。
+# 定位（R2）：纪律护栏而非安全沙箱——正则从简、覆盖诚实犯错通道即可；对抗改写（复制改名 / eval / base64
+#   解码 / 变量拼接出路径）为已知接受漏拦。bypass 前缀（HARNESS_GIT_GUARD_BYPASS=1）已在上方对本规则一并放行。
+# 前置：本段仅在 payload 含 summary.md 子串（不含者已在快速路径零子进程放行 · AC-1.1）时到达；命中 → exit 2，
+#   否则**不退出**、落回下方既有规则（危险命令/DF-011/A-1/A-2/T2 一字不动 · 独立叠加），故读类经此落回后续硬门。
+if [[ "$cmd" == *summary.md* ]]; then
+  _c_deny=0
+  # 左界（SF-1 返修 · code_review_v1）：`(^|[[:space:]]|/)` 遇开引号失配——`sh -c "sed -i … summary.md"` /
+  #   `bash -c 'perl -i … summary.md'` 包壳形态中动词紧邻引号 → 原左界绕过。对齐本文件 T2 `_re_s7_interp`
+  #   同款处理：左界扩含反引号/单引号/双引号（引号是最常见的内层载荷边界）。
+  _c_lb='(^|[[:space:]]|/|`|'"'"'|")'
+  # ① 解释器内联（无法静态区分读写 → 保守 deny · UQ-5）：python/python3 -c、ruby/node -e、perl -e|-i|-pe|-ne
+  _re_c_interp="${_c_lb}"'(python|python3|ruby|node|perl)[[:space:]]+([^[:space:]]+[[:space:]]+)*-[[:alpha:]]*[ceEi][[:alpha:]]*([[:space:]]|$)'
+  # ② sed 就地编辑（-i / -i.bak / 捆绑 -ni / --in-place）——无 -i 的 read 类 sed 落回放行（判定轴 = 写入目标）
+  _re_c_sedi="${_c_lb}"'sed[[:space:]]+([^[:space:]]+[[:space:]]+)*(-[[:alpha:]]*i[[:alpha:]]*(\.[^[:space:]]*)?|--in-place)([[:space:]]|=|$)'
+  # ③ 重定向写入 summary.md（> / >> / >|）——目标 token 须以 summary.md 结尾；`cat summary.md > /tmp/x`
+  #    的 `>` 目标是 /tmp/x（非 summary.md）→ 不命中 → 读→转存放行（AC-1.3）
+  _re_c_redir='(>>|>[|]?)[[:space:]]*[^[:space:]<>|&;]*summary\.md'
+  # ④ tee 落到 summary.md（tee 写其文件实参）
+  _re_c_tee="${_c_lb}"'tee[[:space:]]+[^|&;]*summary\.md'
+  # ⑤ dd of= 目标为 summary.md（if= 读源不拦）
+  _re_c_dd="${_c_lb}"'dd[[:space:]]+[^|&;]*of=[^[:space:]]*summary\.md'
+  # ⑥ ed 打开 summary.md 编辑（左界 space|/|引号|行首，不误命中 sed/red 内嵌 ed）
+  _re_c_ed="${_c_lb}"'ed[[:space:]]+[^|&;]*summary\.md'
+  # ⑦ patch 打到 summary.md
+  _re_c_patch="${_c_lb}"'patch[[:space:]]+[^|&;]*summary\.md'
+  # ⑧ cp/mv 目标（末位参数 = 目的地）为 summary.md——summary.md 作源读转存（末位非 summary）落回放行；
+  #    尾界扩含引号/反引号（SF-1）：`sh -c "cp x summary.md"` 目的地紧邻闭引号亦命中
+  _re_c_cpmv="${_c_lb}"'(cp|mv)[[:space:]]+[^|&;<>]*[[:space:]][^[:space:]]*summary\.md[[:space:]]*($|[;&|<>"'"'"'`])'
+  # ⑨ 间接：find -exec/-execdir/-ok/-okdir <编辑动词>（脚本字面在 -name 位、执行体在 {}）· 复用 T2′ -exec 思路
+  _re_c_findexec="${_c_lb}"'find[[:space:]][^|&;]*-(exec|execdir|ok|okdir)[[:space:]]+([^[:space:]]*/)?(sed|perl|ed|patch|tee|dd|cp|mv)([[:space:]]|$)'
+  # ⑩ 间接：| xargs <编辑动词>（summary.md 经上游 find/ls/grep -l 喂入）· 复用 T2′ feeder 思路
+  _re_c_xargs="${_c_lb}"'xargs[[:space:]]+([^[:space:]]+[[:space:]]+)*([^[:space:]]*/)?(sed|perl|ed|patch|tee|dd|cp|mv)([[:space:]]|$)'
+  if [[ "$cmd" =~ $_re_c_interp ]]; then _c_deny=1; fi
+  if [[ "$_c_deny" == "0" && "$cmd" =~ $_re_c_sedi ]]; then _c_deny=1; fi
+  if [[ "$_c_deny" == "0" && "$cmd" =~ $_re_c_redir ]]; then _c_deny=1; fi
+  if [[ "$_c_deny" == "0" && "$cmd" =~ $_re_c_tee ]]; then _c_deny=1; fi
+  if [[ "$_c_deny" == "0" && "$cmd" =~ $_re_c_dd ]]; then _c_deny=1; fi
+  if [[ "$_c_deny" == "0" && "$cmd" =~ $_re_c_ed ]]; then _c_deny=1; fi
+  if [[ "$_c_deny" == "0" && "$cmd" =~ $_re_c_patch ]]; then _c_deny=1; fi
+  if [[ "$_c_deny" == "0" && "$cmd" =~ $_re_c_cpmv ]]; then _c_deny=1; fi
+  if [[ "$_c_deny" == "0" && "$cmd" =~ $_re_c_findexec ]]; then _c_deny=1; fi
+  if [[ "$_c_deny" == "0" && "$cmd" =~ $_re_c_xargs ]]; then _c_deny=1; fi
+  if [[ "$_c_deny" == "1" ]]; then
+    echo "[harness:pre_bash_guard] 阻断（治理硬门·summary.md · T-1）：检测到用 Bash 文本编辑动词写入 summary.md（sed -i / 重定向 / tee / cp / mv / dd of= / ed / patch / 解释器内联 / find -exec / xargs 等）。summary.md 阶段翻牌一律走 Edit 工具（受 T4 翻牌门治理），不得经 Bash 旁路。如确为例外，请人工确认后以 HARNESS_GIT_GUARD_BYPASS=1 前缀重试。" >&2
+    exit 2
+  fi
 fi
 
 # ---- 危险命令模式（既有逐条原样保留；--force 以子串从严命中 --force-with-lease；含 { 的模式先存变量再 =~）----

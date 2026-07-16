@@ -181,6 +181,8 @@ spec: docs/stage-01-Harness体系建设/02-体系设计/04-编排中枢-Applicat
 
 > 降本执行纪律（来源 `.harness/improvement/proposal-002-subagent-speedup-20260611.md` §3 + `.harness/improvement/proposal-010-token-cost-diagnosis-20260711.md` 账单级实测：子 Agent 2,595 次调用中 Haiku 仅 1.9%，「建议非强制」分档纸面化一个月完全未执行，故升格为**默认档**）。机械执行阶段委派子 Agent 时**默认**按下表传 `model` 参数（opt-out 语义）；推理/对抗/编码阶段维持 Opus 不降。**Owner 保留按风险上调档位的最终判断权**（上调不设审批；默认即最低档，无下调空间）；降档安全阀 R1–R4 见表后。
 
+> **机器可读权威源 = `plugins/harness-core/config/model_tiers.tsv`**（消费方 hook `pretool_agent_delegation_guard.sh` 对表校验委派 `model` 参数的依据 · T-4）；下表为人读展示，值须与 sidecar 逐阶段一致，二者由守护测试强制一致（AC-5.4 · 来源卡 `chore-hook-governance-hardening-20260715`）。
+
 | 阶段 | 性质 | 模型档（默认） | 理由 |
 |---|---|---|---|
 | 1 需求分析 | 推理/澄清 | **Opus（不降）** | 歧义识别与范围收敛，质量优先 |
