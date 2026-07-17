@@ -132,9 +132,9 @@ mirror_sync_classify() {
   [ -r "$mf" ] || { printf 'unclassified\n'; return 0; }
   while IFS= read -r line; do
     case "$line" in ''|'#'*) continue ;; esac
-    # shellcheck disable=SC2086
-    set -- $line
-    class="${1:-}"; glob="${2:-}"; flag="${3:-}"
+    # read -r 分词：天然不做 glob 展开（避宿主 cwd pathname expansion 撞名致泛 glob 退化）、
+    # 作用域局部、bash 3.2 兼容；manifest 行最多 3 字段，多余尾字段被 flag 吸收，语义等价 set -- 分词。
+    read -r class glob flag <<< "$line"
     [ -n "$glob" ] || continue
     case "$path" in
       $glob)
@@ -162,9 +162,9 @@ mirror_sync_scan_roots() {
   [ -r "$mf" ] || return 0
   while IFS= read -r line; do
     case "$line" in ''|'#'*) continue ;; esac
-    # shellcheck disable=SC2086
-    set -- $line
-    glob="${2:-}"; [ -n "$glob" ] || continue
+    # read -r 分词：同 classify，避宿主 cwd glob 展开撞名致泛 glob 退化（class/flag 字段丢弃）。
+    read -r _ glob _ <<< "$line"
+    [ -n "$glob" ] || continue
     case "$glob" in
       *'*'*) root="${glob%%\**}"; root="${root%/}" ;;   # 取首个 * 前的目录段
       *)     root="$(dirname "$glob")" ;;               # 精确文件 → 其目录
