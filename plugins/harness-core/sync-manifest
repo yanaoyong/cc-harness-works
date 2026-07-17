@@ -68,6 +68,32 @@ machine  config/*
 #   （同理精确到该 corpus 子目录避 cwd 撞名），否则镜像不铺、消费方缺 corpus、依赖它的旁路检索静默空转。
 machine  wiki-background/harness-lessons/*
 
+# ── transcript-archive 产物（machine 类 · feat-transcript-archive-20260717 · T6/AC-6 逐一枚举防泛称漏项）──
+# 本卡 T1-T5 新增 5 个具名 machine 双副本产物（各含 plugins/harness-core/ 权威源 + .harness/ 镜像）。
+# AC-6 三处同一具名清单（sync-manifest / MIRROR_FILES / AC-6 断言）逐一枚举，消泛称漏项（v0.8.11 族教训）：
+#   1. scripts/transcript_archive.py          （CLI 主程序 · T3）
+#   2. scripts/lib/transcript_lean.py         （lean 提取+脱敏库 · T1）
+#   3. scripts/lib/transcript_index.py        （by-instance 索引库 · T2）
+#   4. scripts/transcript_archive_cron.sample （cron 样例 · T5）
+#   5. hooks/session_end_transcript.sh        （SessionEnd hook · T5）
+# 前 4 项落 scripts/ 子树、**已由上方 `machine scripts/*` glob 覆盖分类并铺送**（同 rules/ 现 12 机器件
+#   逐一登记备审惯例：glob 已铺、此处显式枚举精确条目备审 + 供 AC-6 grep 断言命中；不重复落功能行——
+#   若为 scripts/lib/*.py 落精确功能条目会令 scan_roots dirname 派生出重叠 `scripts/lib` 扫描根、与既有
+#   `scripts` 根令同文件被 find 双遍历重复处理，故此处仅注释枚举、复用 `scripts/*` 单根）。
+# 第 5 项落 hooks/ 子树——**上方无任何 hooks glob**（plugin hooks/ 下 ~20 个 hook 经 plugin hooks.json
+#   原生分发、非 .harness 镜像管理，现 .harness/hooks/ 仅此 1 个镜像文件），故此为真缺口：须显式登记方能
+#   把该单 hook 铺到消费方 .harness/hooks/。
+# ⚠ 禁 `hooks/*` 泛 glob（两重原因）：① 泛 glob 会把 plugin hooks/ 下全部 ~20 个 hook 误分类 machine、
+#   全量扫进消费方 .harness/hooks/（越界污染——那些 hook 无 .harness 镜像、也不该有）；② 泛 glob 有宿主 cwd
+#   pathname-expansion 撞名退化风险（wiki-background/* 教训）。精确单文件路径（无 `*` 元字符）双免：
+#   read -r 分词天然不展开 → 不被 cwd 撞名；scan_roots 取 dirname=hooks 遍历、classify 仅该文件精确命中、
+#   同目录其余 hook 落 unclassified 不铺。既有 `HARNESS_CONFIG.yaml.template`（下方 opt-out 区）即精确单文件登记先例。
+# skill/命令类新增（skills/transcript-archive/** · commands/transcript-archive-enable.md）按 manifest 既有
+#   分类惯例**已被现况 glob 覆盖、无须新增条目**：skills/transcript-archive/** 由上方 `machine skills/*` 覆盖
+#   （machine · 刷新铺送）；commands/transcript-archive-enable.md 由上方 `machine commands/* opt-out` 覆盖
+#   （machine · opt-out 保留登记不刷镜像 · 与既有 commands 分类惯例一致）。
+machine  hooks/session_end_transcript.sh
+
 # ── 半定制件（semi · 覆盖 + 身份回填）──
 # agents/* 全归 semi：含 HARNESS:IDENTITY 标记块的（application-owner.md）覆盖后重跑 init_identity 回填身份段；
 # 无标记块的（reviewer/generator/strategist/entropy/README）semi 处理器等价纯覆盖（无身份段可回填）。

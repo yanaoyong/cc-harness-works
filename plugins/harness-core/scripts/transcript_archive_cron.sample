@@ -1,0 +1,46 @@
+# ============================================================================
+# transcript_archive_cron.sample —— transcript 归档 cron 入口样例（crontab 行）
+# 变更卡 feat-transcript-archive-20260717 · T5（触发入口：hook + cron）。
+#
+# 用途：手动命令 / cron / SessionEnd hook 三入口复用同一 transcript_archive.py。cron 入口适合
+#       无 GUI/无交互会话的机器，或作为 SessionEnd hook 的兜底（hook 在 worktree 下可能被杀，
+#       cron 定时补齐——关联提取纯离线读 JSONL，不依赖运行时 hook 存活）。
+#
+# 用法：本文件为**样例**（.sample 语义 · 不可执行也可），不会被任何入口自动加载。按需将下方
+#       某一行（改成你机器上的绝对路径）追加进你的 crontab：
+#         crontab -e        # 编辑当前用户 crontab，粘贴并改路径
+#         crontab -l        # 确认已生效
+#
+# 前置：
+#   - python3 3.11+（纯 stdlib · 零第三方依赖）。
+#   - 已按启用 skill 完成 opt-in 启用（状态目录下 config.json 存在且 "enabled": true）；
+#     未启用时脚本零副作用（与 hook 同 opt-in 门），cron 空转无害。
+# ============================================================================
+
+# ── 环境变量：状态目录（可选）──
+# transcript_archive.py 的状态目录（config.json / watermarks.json 等机器本地状态所在）默认
+# 为 ~/.claude/harness-transcript-archive。若你改了默认位置，在 crontab 顶部显式导出：
+#   HARNESS_TRANSCRIPT_ARCHIVE_HOME=/abs/path/to/harness-transcript-archive
+# 注意：cron 的 HOME 与登录 shell 可能不同 —— 建议**写死绝对路径**，勿依赖 ~ 展开。
+
+# ── 脚本绝对路径：三级路径任选其一写死（与 hook 三级回退口径一致）──
+#   链① 消费方安装态：<你的仓库>/.harness/scripts/transcript_archive.py
+#   链② 本仓开发态　：<你的仓库>/plugins/harness-core/scripts/transcript_archive.py
+#   链③ plugin 包内　：<CLAUDE_PLUGIN_ROOT>/scripts/transcript_archive.py
+# cron 无 hook 的运行时路径解析，须把上面某一条**展开为绝对路径**填入下方（示例用链①占位）。
+
+# ── crontab 行样例 ──────────────────────────────────────────────────────────
+# 每小时第 17 分：增量 sync（不推远端 · 本机 lean 提取 + 冷层落盘 + 归档仓本地 commit）。
+#   错峰分钟数（17）避开整点，减少与其它定时任务/SessionEnd hook 的锁竞争（并发由脚本内
+#   归档仓级 flock 自理：contention 时第二实例干净 skip、不重复提交、不改水位）。
+17 * * * * python3 /abs/path/to/repo/.harness/scripts/transcript_archive.py sync >> /abs/path/to/logs/transcript_archive.sync.log 2>&1
+
+# 每日 03:23：sync --push（把归档仓推到用户提供的 GitHub 私有 remote · 显式方推）。
+#   --push 遇非 fast-forward 会 pull --rebase + 重建索引后重试一次，再败留待下轮（不强推）。
+23 3 * * * python3 /abs/path/to/repo/.harness/scripts/transcript_archive.py sync --push >> /abs/path/to/logs/transcript_archive.push.log 2>&1
+
+# ── 日志建议 ────────────────────────────────────────────────────────────────
+#   - >> …log 2>&1 追加合并 stdout/stderr，便于事后排查（含 flock skip 可观测行、
+#     cold_sync warning、陈旧锁告警等 · 见 spec AC-8/AC-9）。
+#   - 定期轮转日志（logrotate 或 cron 内 truncate），避免无界增长。
+#   - 监控层可 grep 日志中的 skip 时间戳/连续 skip，发现归档静默停摆（假绿）。
