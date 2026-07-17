@@ -147,17 +147,31 @@ sid="$(printf '%s' "${session_id:-nosid}" | tr -cd 'A-Za-z0-9._-')"
 [ -n "$sid" ] || sid="nosid"
 deleg="$sdir/delegations_${sid}.log"
 
-# AC-10.b 证据类失败：台账缺失/不可读 → 视同无委派证据 → deny
-if [ ! -r "$deleg" ]; then
-  printf '[harness:summary_flip_guard] 阻断：产出型阶段（%s）禁止 Owner inline——本会话委派台账缺失或不可读（%s），无 generator 委派证据。请委派 generator 完成后再翻牌（卡 %s）。恢复：确认 PreToolUse(Agent) hook（pretool_agent_delegation_guard.sh）正常落盘委派台账。\n' "$flipped" "$deleg" "$card_dir" >&2
+# 【缺口② 跨-session union · fix-governance-hook-gaps · T2 · UQ-2=a · 冻结契约 ⑦】：sid 中途轮换后 generator
+#   委派台账落旧 sid 文件（delegations_<oldsid>.log），T4 翻牌门按新 sid 查询 delegations_<newsid>.log 无记录
+#   → 证据类误拦真实委派（同缺口② · 与 pre_bash_guard 授权门同源）。修法 = 委派台账**定位**从「仅当前 sid 文件」
+#   放宽为「同 STATE_DIR 内跨全部 delegations_*.log 文件 union」。union 只放松台账**定位**，不放松内容判据——
+#   跨卡守恒（$4==card_dir）保留：他卡委派即便命中旧 sid 文件、因 $4!=card_dir 仍 deny（负例守恒）。
+# 收集全部可读 delegations_*.log（含当前 sid 与轮换前旧 sid）；`-f && -r` 逐文件过滤（glob 未命中回退字面亦被滤）。
+deleg_files=""
+for f in "$sdir"/delegations_*.log; do
+  [ -f "$f" ] && [ -r "$f" ] && deleg_files="${deleg_files}${f}"$'\n'
+done
+
+# AC-10.b 证据类失败：跨全部 sid 文件后仍无任何可读委派台账 → 视同无委派证据 → deny
+if [ -z "$deleg_files" ]; then
+  printf '[harness:summary_flip_guard] 阻断：产出型阶段（%s）禁止 Owner inline——本会话委派台账缺失或不可读（%s · 跨全部 delegations_*.log 均无可读台账），无 generator 委派证据。请委派 generator 完成后再翻牌（卡 %s）。恢复：确认 PreToolUse(Agent) hook（pretool_agent_delegation_guard.sh）正常落盘委派台账。\n' "$flipped" "$deleg" "$card_dir" >&2
   exit 2
 fi
 
-# 同卡 generator 委派记录存在即放行（首期宽松：阶段号不强制匹配）
-if awk -F'\t' -v c="$card_dir" '($2 ~ /generator/) && ($4 == c) {found=1} END{exit found?0:1}' "$deleg" 2>/dev/null; then
-  exit 0
-fi
+# 同卡 generator 委派记录存在于**任一** sid 文件即放行（首期宽松：阶段号不强制匹配 · $4==card_dir 跨卡守恒）
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  if awk -F'\t' -v c="$card_dir" '($2 ~ /generator/) && ($4 == c) {found=1} END{exit found?0:1}' "$f" 2>/dev/null; then
+    exit 0
+  fi
+done <<< "$deleg_files"
 
-# 台账在场但无同卡 generator 记录 → 规则命中 deny（AC-10.a / AC-8）
+# 台账在场但（跨全部 sid 文件）无同卡 generator 记录 → 规则命中 deny（AC-10.a / AC-8）
 printf '[harness:summary_flip_guard] 阻断：产出型阶段（%s）禁止 Owner inline，请委派 generator 完成后再翻牌（阶段 %s · 卡 %s）。委派台账中无该卡的 generator 记录——先经 Agent 委派 generator 产出，放行后再翻牌 summary。\n' "$flipped" "$flipped" "$card_dir" >&2
 exit 2

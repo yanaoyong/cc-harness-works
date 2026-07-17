@@ -20,6 +20,7 @@ raw JSONL 坏行（非 JSON）skip 不抛，保持库健壮。
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any, Callable, Iterable
@@ -27,11 +28,23 @@ from typing import Any, Callable, Iterable
 # --- 冻结常量（改动会破坏幂等/快照，须谨慎） ---------------------------------
 
 # 信号二：tool_use 参数路径中的变更实例名捕获。
-_CHANGES_RE = re.compile(r"\.harness/changes/([^/]+)/")
-# 信号一：change/<x> 分支 → K 卡实例名 <x>。
-_CHANGE_BRANCH_RE = re.compile(r"^change/(.+)$")
+# 字符集收紧为合法卡名字符集（spec §2.3 C-2 · [A-Za-z0-9._-]+）——真实卡名
+# （fix-…-20260717 / chore-… / proj-…）全落此集；杜绝 [^/]+ 吞下 transcript 内
+# 含 .harness/changes/ 的命令文本碎片（空格/引号/换行）致污染实例名。
+_CHANGES_RE = re.compile(r"\.harness/changes/([A-Za-z0-9._-]+)/")
+# 信号一：change/<x> 分支 → K 卡实例名 <x>（同收紧字符集，防含其他字符的分支误捕）。
+_CHANGE_BRANCH_RE = re.compile(r"^change/([A-Za-z0-9._-]+)$")
 # M 元流程实例名前缀。
 _META_PREFIX = "proj-"
+
+# by-instance 落盘 slug 消毒上限与哈希后缀长度（spec §2.3 C-2 冻结值）。
+# 上限 80 字符；超限 → 前 (80-1-12)=67 字符 + "-" + sha256(原始 name)[:12]。
+SLUG_MAX = 80
+SLUG_HASH_LEN = 12
+# 消毒后为空时的安全占位（不得产出空文件名）。
+SLUG_FALLBACK = "_invalid"
+# slug 落盘允许字符集（与 _CHANGES_RE 捕获集一致）。
+_SLUG_ILLEGAL_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 # index.tsv 集合列内部分隔符（排序后 join，保证确定性）。
 SET_SEP = ","
@@ -114,6 +127,29 @@ def _sanitize_summary(text: str) -> str:
 def _kind_of(instance_name: str) -> str:
     """实例名 → 类型：proj- 前缀 = M，其余 = K。"""
     return "M" if instance_name.startswith(_META_PREFIX) else "K"
+
+
+def _sanitize_slug(name: str) -> str:
+    """把实例名消毒为有界、确定性、可落盘的 by-instance 文件名 slug。
+
+    落盘侧兜底（解析正则已收紧字符集，此为纵深防御，护住构造/历史脏数据）：
+      1. 剥离非 ``[A-Za-z0-9._-]`` 字符。
+      2. 剥离后为空 → 回退安全占位 ``SLUG_FALLBACK``，绝不产出空文件名。
+      3. 长度 > ``SLUG_MAX``(80) → 取前 ``SLUG_MAX - 1 - SLUG_HASH_LEN``(=67) 字符
+         + ``"-"`` + ``sha256(原始 name).hexdigest()[:SLUG_HASH_LEN]``(12)，合成
+         定长 80 字符 slug，杜绝 ``OSError: File name too long``。
+
+    确定性铁律：哈希对**原始 name** 串取（非消毒后串），同输入逐字节同输出，
+    护 index/by-instance 幂等（本库首段声「输出确定性是最高设计约束」）。
+    """
+    cleaned = _SLUG_ILLEGAL_RE.sub("", name)
+    if not cleaned:
+        return SLUG_FALLBACK
+    if len(cleaned) > SLUG_MAX:
+        digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:SLUG_HASH_LEN]
+        keep = SLUG_MAX - 1 - SLUG_HASH_LEN  # 80 - 1 - 12 = 67
+        cleaned = cleaned[:keep] + "-" + digest
+    return cleaned
 
 
 # --- 对外接口（签名冻结） ---------------------------------------------------
@@ -229,7 +265,9 @@ def render_by_instance(
         row = (meta.get("session", ""), meta.get("date", ""), lean_relpath(meta))
         if cards:
             for card in cards:
-                key = f"by-instance/{project}/{card}.md"
+                # 文件名用消毒后 slug（有界/确定性/可落盘）；页内展示名保留原始 card。
+                slug = _sanitize_slug(card)
+                key = f"by-instance/{project}/{slug}.md"
                 pages.setdefault(key, set()).add(row)
                 page_meta[key] = (project, card, _kind_of(card))
         else:

@@ -163,6 +163,57 @@ def commit_if_changed(archive_dir: Path, message: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# 硬门前置（缺陷③ · 所有 commit 入口无旁路 · MUST FIX-2 · C-3 T3 消费）
+# --------------------------------------------------------------------------- #
+
+def _hard_gate_before_commit(ctx: "Ctx") -> list[dict]:
+    """commit 前对将入库 lean 产物跑硬门（第二检测器超集）——所有 commit 入口共用。
+
+    先 ``git add -A`` 暂存本次将入库变更，取 ``git diff --cached --name-only`` 的 staged 文件、
+    筛 ``*.lean.jsonl``；逐个读归档仓内该 lean 文件行，调
+    ``transcript_lean.hard_gate_scan(lines, allow_fingerprints=ctx.hard_gate_allow_fingerprints)``
+    汇总所有 findings（每条附 ``file`` = 相对归档仓路径，供人工定位）。
+
+    扫描对象 = ``git add -A`` 后暂存区内 lean 产物——**涵盖脏树里 processed=0 未过门的旧产物**，
+    杜绝上轮崩溃滞留产物经补 commit 绕过硬门（C-3「所有 commit 入口无旁路」）。
+
+    返回非空 = 命中真密钥形态（且不在已审 fingerprint 白名单）→ 调用方须 fail-closed
+    （非零退出、不 commit / 不 push / 不推进水位）。staged 删除等无内容项跳过（无泄漏面）。
+    """
+    run_git(ctx.archive_dir, ["add", "-A"])
+    staged = run_git(ctx.archive_dir, ["diff", "--cached", "--name-only"]).stdout.splitlines()
+    findings: list[dict] = []
+    for rel in staged:
+        rel = rel.strip()
+        if not rel.endswith(".lean.jsonl"):
+            continue
+        fpath = ctx.archive_dir / rel
+        if not fpath.is_file():
+            continue  # staged 删除 / 缺失 → 无内容可扫
+        lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
+        for hit in transcript_lean.hard_gate_scan(
+            lines, allow_fingerprints=ctx.hard_gate_allow_fingerprints
+        ):
+            enriched = dict(hit)
+            enriched["file"] = rel
+            findings.append(enriched)
+    return findings
+
+
+def _warn_hard_gate_findings(findings: list[dict]) -> None:
+    """fail-closed 时把每条命中打到 stderr（掩码化 snippet + fingerprint），供人工审白名单。"""
+    warn(
+        f"硬门命中 {len(findings)} 处真密钥形态 → fail-closed：不 commit / 不 push、非零退出。"
+        f"人工核实伪命中后可把对应 fingerprint 加入 config.json 的 hard_gate_allow_fingerprints 放行"
+    )
+    for hit in findings:
+        warn(
+            f"  [{hit.get('rule')}] {hit.get('file', '?')}:{hit.get('line_no')} "
+            f"snippet={hit.get('snippet')} fingerprint={hit.get('fingerprint')}"
+        )
+
+
+# --------------------------------------------------------------------------- #
 # flock 串行化 + 锁龄检测（AC-9）
 # --------------------------------------------------------------------------- #
 
@@ -227,6 +278,11 @@ class Ctx:
         self.denylist_path = cfg.get("denylist_path") or None
         self.cold_sync_cmd = (cfg.get("cold_sync_cmd") or "").strip()
         self.lock_stale_seconds = int(cfg.get("lock_stale_seconds") or DEFAULT_LOCK_STALE_SECONDS)
+        # 硬门已审 fingerprint 白名单（缺陷③ · C-3 C 半：命中且 fingerprint∈白名单→放行）。
+        # 来源 = config.json 的 hard_gate_allow_fingerprints（list[str]，缺省 []）→ frozenset。
+        self.hard_gate_allow_fingerprints: frozenset[str] = frozenset(
+            cfg.get("hard_gate_allow_fingerprints") or []
+        )
         # 机器本地水位（不入归档仓 · HITL-2 多机修订）
         self.watermarks_path = state_home / "watermarks.json"
         self.watermarks: dict = load_watermarks(self.watermarks_path)
@@ -542,6 +598,12 @@ def push_with_conflict_retry(ctx: Ctx) -> bool:
         warn(f"pull --rebase 失败，留待下轮: {rebase.stderr.strip()}")
         return False
     rebuild_index(ctx)  # 派生物全量重写，不三方合并
+    # 硬门（commit 前 · rebase 后 commit 入口对称加固 · LOW-B）：rebase 可能引入远端未过门
+    # 产物、或与本地脏产物叠加——commit 前同过硬门，命中真密钥形态则 fail-closed 不 commit / 不重推。
+    findings = _hard_gate_before_commit(ctx)
+    if findings:
+        _warn_hard_gate_findings(findings)
+        return False
     commit_if_changed(ctx.archive_dir, "transcript-archive: rebuild index after rebase")
     second = run_git(ctx.archive_dir, ["push"], check=False)
     if second.returncode != 0:
@@ -554,10 +616,51 @@ def push_with_conflict_retry(ctx: Ctx) -> bool:
 # 子命令实现
 # --------------------------------------------------------------------------- #
 
+HARD_GATE_FAIL_RC = 5
+"""硬门 fail-closed 的非零退出码（缺陷③ · 命中真密钥形态时不 commit / 不 push）。"""
+
+
 def _run_extract_pipeline(ctx: Ctx, ignore_watermark: bool, do_push: bool) -> int:
-    """sync/backfill 共用管线（临界区内）：cold_sync 重试 → 主提取 → 保留 → 索引 → commit → push。"""
+    """sync/backfill 共用管线（临界区内）。
+
+    顺序：cold_sync 重试 → **起手脏树对账（硬门→补 commit）** → 主提取 → 保留 → 索引 →
+    **硬门（commit 前 fail-closed）** → commit → **水位持久化（commit 之后）** → push。
+
+    缺陷③（硬门接线 · MUST FIX-2 无旁路）：所有 commit 入口（起手脏树对账补 commit + 主提取后
+    常规 commit）在 ``commit_if_changed`` 前均跑 ``_hard_gate_before_commit``；命中真密钥形态
+    （非白名单）→ fail-closed（非零退出、不 commit / 不 push）。
+    缺陷④（水位时序）：``save_watermarks`` 移到 commit 成功之后——硬门 fail-closed 或 commit
+    抛错时水位不前进、下轮可重提（AC-7）；起手脏树对账补 commit 收敛上轮崩溃滞留 lean 产物
+    （AC-8 · LOW-C：仅脏树含 ``*.lean.jsonl`` 时触发，非 lean 脏变更由 step 6 常规 commit 收敛）。
+    """
+    mode = "backfill" if ignore_watermark else "sync"
+
     # 1. failed.list 下轮重试（C-2(i)·须在 flock 临界区内、主提取前）
     retry_failed_cold_sync(ctx)
+
+    # 1b. 起手脏树对账（缺陷④ AC-8/AC-8b · LOW-C 精修 HITL-3）：上轮崩溃落盘但未 commit 的
+    #     lean 产物 → 先过同一硬门（脏树里 processed=0 的旧产物不得绕门），硬门通过才补 commit
+    #     收敛入库。**仅当脏树含 `*.lean.jsonl` 产物时才触发**——脏树仅含非 lean 变更（如首跑
+    #     `ensure_state_and_gitignore` 造出的 `.gitignore` / `.state/` 无关文件）不再误作
+    #     "orphaned products" 补一次多余 infra commit（AC-8 LOW-C）；非 lean 的合法脏变更由后续
+    #     step 6 常规 commit（同样过硬门）自然收敛。
+    # `-uall` 展开未跟踪目录为逐个文件（默认 porcelain 会把全新未跟踪目录折叠为单行 `?? dir/`，
+    # 致某 project/某月首次归档即崩溃的 orphan lean 产物被漏判——见评审 MUST FIX-1）。与 step 6
+    # `git add -A`+`git diff --cached --name-only` 判定同覆盖面（逐文件）。
+    porcelain = run_git(ctx.archive_dir, ["status", "--porcelain", "-uall"]).stdout
+    # porcelain 每行前 3 字符为 XY+空格状态位（如 `?? path` / ` M path` / `A  path`）；剥前缀取
+    # 路径再判尾缀。重命名 `R  old -> new` 罕见于归档产物，用整行尾 endswith 容错（末位为新路径）。
+    has_orphan_lean = any(
+        line[3:].rstrip().endswith(".lean.jsonl")
+        for line in porcelain.splitlines()
+        if line.strip()
+    )
+    if has_orphan_lean:
+        findings = _hard_gate_before_commit(ctx)
+        if findings:
+            _warn_hard_gate_findings(findings)
+            return HARD_GATE_FAIL_RC  # 脏树含真密钥旧 lean 产物 → 不补 commit（AC-8b）
+        commit_if_changed(ctx.archive_dir, "transcript-archive reconcile: commit orphaned lean products")
 
     # 2. 主提取（热层 + 冷层 + 附属目录）
     processed = 0
@@ -565,8 +668,7 @@ def _run_extract_pipeline(ctx: Ctx, ignore_watermark: bool, do_push: bool) -> in
         if process_session(ctx, project, session_id, jsonl, ignore_watermark):
             processed += 1
 
-    # 3. 水位 + failed.list 持久化（与 failed.list 同临界区 · 防 lost update）
-    save_watermarks(ctx.watermarks_path, ctx.watermarks)
+    # 3. failed.list 持久化（水位延后到 commit 成功之后 · 缺陷④）
     save_failed_list(ctx.failed_list_path, ctx.cold_sync_failed)
 
     # 4. 冷层保留策略（跳过 failed.list 待同步项）
@@ -575,14 +677,22 @@ def _run_extract_pipeline(ctx: Ctx, ignore_watermark: bool, do_push: bool) -> in
     # 5. 索引联动重建（提取后）
     rebuild_index(ctx)
 
-    # 6. commit（无 diff 不空转）
-    mode = "backfill" if ignore_watermark else "sync"
+    # 6. 硬门（commit 前 · 命中真密钥形态 fail-closed · AC-5）
+    findings = _hard_gate_before_commit(ctx)
+    if findings:
+        _warn_hard_gate_findings(findings)
+        return HARD_GATE_FAIL_RC  # 不 commit / 不 push / 不推进水位（AC-5 + AC-7）
+
+    # 7. commit（无 diff 不空转；硬门已 git add -A，commit_if_changed 幂等再 add）
     committed = commit_if_changed(
         ctx.archive_dir, f"transcript-archive {mode}: {processed} session(s) @ {int(time.time())}"
     )
     log(f"{mode}: processed={processed} committed={committed}")
 
-    # 7. push（显式方推）
+    # 8. 水位持久化（commit 成功之后 · 缺陷④：commit 失败/硬门 fail-closed 时水位不前进、下轮可重提）
+    save_watermarks(ctx.watermarks_path, ctx.watermarks)
+
+    # 9. push（显式方推）
     rc = 0
     if do_push:
         if not push_with_conflict_retry(ctx):
@@ -603,6 +713,13 @@ def cmd_backfill(ctx: Ctx, args) -> int:
 
 def cmd_index(ctx: Ctx, args) -> int:
     rebuild_index(ctx)
+    # 硬门（commit 前 · 第三条 commit 入口无旁路 · MUST FIX-2 · 比照 step 6）：
+    # commit_if_changed 内 git add -A 会暂存工作树一切变更（含上轮崩溃/fail-closed 滞留的
+    # 未脱敏 lean 脏产物）——index 路径此前缺此门致真密钥旁路入库（code_review_v1 MUST FIX-A）。
+    findings = _hard_gate_before_commit(ctx)
+    if findings:
+        _warn_hard_gate_findings(findings)
+        return HARD_GATE_FAIL_RC  # 命中真密钥形态 → 不 commit（AC-5 / MUST FIX-2 无旁路）
     committed = commit_if_changed(ctx.archive_dir, f"transcript-archive index @ {int(time.time())}")
     log(f"index: committed={committed}")
     print(json.dumps({"mode": "index", "committed": committed}), flush=True)

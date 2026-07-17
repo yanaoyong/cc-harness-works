@@ -120,10 +120,25 @@ _PRIVATE_KEY_RE = re.compile(
     r"[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)"
 )
 
+# 顺序敏感：``ANTHROPIC_KEY``（``sk-ant-`` 前缀）必须先于通用 ``SK_KEY``（``sk-`` 前缀），
+# 否则 ``sk-ant-…`` 会被通用 SK_KEY 先命中、误归类（R-2 / AC-4）。
+# C-1 不变量：每条脱敏规则的前缀字面 / charset / 长度下限均构造为对应 HARD_GATE_RULES 规则的
+# **子集或相等**，使脱敏命中面 ⊆ 硬门命中面（逐条对应关系见 HARD_GATE_RULES 注释）。
 BUILTIN_SECRET_RULES: list[tuple[str, re.Pattern]] = [
     ("ANTHROPIC_KEY", re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}")),
+    # 通用 sk-（DeepSeek 等 · UQ-3 阈值 N=20）——须置于 ANTHROPIC_KEY 之后。
+    ("SK_KEY", re.compile(r"sk-[A-Za-z0-9_\-]{20,}")),
+    # 原 ghp_ 规则保留（gh[pousr]_ 的子集）——ghp_ 命中先归 GITHUB_TOKEN，护既有守护快照。
     ("GITHUB_TOKEN", re.compile(r"ghp_[A-Za-z0-9]{20,}")),
+    # GitHub 全变体（classic ghp_/gho_/ghu_/ghs_/ghr_）——补齐 ghp_ 未覆盖的 o/u/s/r 变体。
+    ("GITHUB_TOKEN_ALL", re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")),
+    # GitHub fine-grained PAT——charset **无连字符**，与硬门 github_fine_grained 完全一致（C-1）。
+    ("GITHUB_PAT", re.compile(r"github_pat_[A-Za-z0-9_]{20,}")),
     ("AWS_ACCESS_KEY", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("SLACK_TOKEN", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("GITLAB_PAT", re.compile(r"glpat-[A-Za-z0-9_\-]{16,}")),
+    # Google API key——与硬门收紧后完全同边界同 charset（精确 35 位尾 + 词边界 · C-1 / C-3 B）。
+    ("GOOGLE_API_KEY", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
     ("PRIVATE_KEY", _PRIVATE_KEY_RE),
     ("BEARER_TOKEN", re.compile(r"Bearer\s+[A-Za-z0-9._\-]{8,}")),
 ]
@@ -133,16 +148,22 @@ BUILTIN_SECRET_RULES: list[tuple[str, re.Pattern]] = [
 # 覆盖脱敏漏网族：GitHub 全变体 / AWS 临时 / Slack / GitLab / Google / 私钥标记 / Bearer。
 # --------------------------------------------------------------------------- #
 
+# 硬门 ⊇ 脱敏（C-1）：逐条为 BUILTIN_SECRET_RULES 的检测超集。
+# 顺序：anthropic_key 先于 generic_sk（与脱敏族同序，护 sk-ant- 先命中）。
 HARD_GATE_RULES: list[tuple[str, re.Pattern]] = [
     ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}")),
+    # 通用 sk（⊇ 脱敏 SK_KEY · 同 charset 同 {20,}）——须先于其后规则、后于 anthropic_key。
+    ("generic_sk", re.compile(r"sk-[A-Za-z0-9_\-]{20,}")),
     ("github_classic", re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")),
     ("github_fine_grained", re.compile(r"github_pat_[A-Za-z0-9_]{20,}")),
     ("aws_access_key", re.compile(r"A(?:KIA|SIA)[0-9A-Z]{16}")),
     ("slack_token", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
     ("gitlab_pat", re.compile(r"glpat-[A-Za-z0-9_\-]{16,}")),
-    ("google_api_key", re.compile(r"AIza[0-9A-Za-z_\-]{30,}")),
+    # C-3 B 收紧：精确 35 位尾 + 词边界（Google key 精确 39 字符），杜绝嵌于长 base64 的伪命中。
+    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
     ("private_key_block", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")),
-    ("bearer_token", re.compile(r"Bearer\s+[A-Za-z0-9._\-]{16,}")),
+    # UQ-4 reconcile：下调至 {8,} 对齐脱敏 BEARER_TOKEN，恢复 8–15 长区间的 C-1 不变量。
+    ("bearer_token", re.compile(r"Bearer\s+[A-Za-z0-9._\-]{8,}")),
 ]
 
 
@@ -477,21 +498,39 @@ def _mask(s: str) -> str:
     return f"{s[:4]}***(len={len(s)})"
 
 
-def hard_gate_scan(lines: Iterable[str]) -> list[dict]:
+def hard_gate_scan(
+    lines: Iterable[str],
+    allow_fingerprints: frozenset[str] = frozenset(),
+) -> list[dict]:
     """硬门层扫描：用**独立维护的 secret ruleset 超集**逐行扫描（与脱敏族不同源）。
 
-    每命中一 dict：``{rule, line_no, snippet}``（snippet 为脱敏化掩码片段，不回显原始密钥）。
-    正控：对脱敏后 lean 产物扫描应得 ``[]``；负控：对未脱敏 raw 扫描应得非空（扫描器非惰性）。
+    每命中一 dict：``{rule, line_no, snippet, fingerprint}``（snippet 为脱敏化掩码片段，不回显
+    原始密钥；fingerprint 为确定性单向指纹，见下）。正控：对脱敏后 lean 产物扫描应得 ``[]``；
+    负控：对未脱敏 raw 扫描应得非空（扫描器非惰性）。
+
+    参数
+    ----
+    allow_fingerprints:
+        已审白名单指纹集（默认空集，既有单参调用零破坏）。凡命中的 ``fingerprint`` ∈ 本集的
+        finding **从返回列表剔除**（人工审为伪命中后放行），其余照常返回（C-3 · UQ-1=B+C）。
+
+    fingerprint = ``sha256(f"{rule}:{命中原文}").hexdigest()[:16]``——确定性、单向不可逆、
+    非密钥回显（仅供 T3 fail-closed 时打印供人工审核、加入 config 白名单，下轮放行）。
     """
     findings: list[dict] = []
     for i, line in enumerate(lines, 1):
         text = line if isinstance(line, str) else str(line)
         for name, pat in HARD_GATE_RULES:
             for m in pat.finditer(text):
+                hit = m.group(0)
+                fingerprint = hashlib.sha256(f"{name}:{hit}".encode()).hexdigest()[:16]
+                if fingerprint in allow_fingerprints:
+                    continue  # 已审伪命中白名单放行，杜绝永久阻断归档（C-3 · AC-6）
                 findings.append({
                     "rule": name,
                     "line_no": i,
-                    "snippet": _mask(m.group(0)),
+                    "snippet": _mask(hit),
+                    "fingerprint": fingerprint,
                 })
     return findings
 

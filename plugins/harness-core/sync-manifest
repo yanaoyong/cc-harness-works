@@ -55,15 +55,17 @@ machine  config/*
 # 镜像语义：plugin 根相对 wiki-background/harness-lessons/X → 消费方 .harness/wiki-background/harness-lessons/X
 #   （dest_rel 默认映射）。case 语义下末尾 `*` 匹配含 `/`，命中该目录下全部文件；scan_roots 取首 `*` 前段
 #   = wiki-background/harness-lessons 作遍历根，find -type f 递归枚举全部 corpus 文件。
-# ⚠ glob 精确到 harness-lessons/ 子目录（非泛 `wiki-background/*`）的原因（实测定论 · 非保守选择）：
-#   mirror_sync_classify/scan_roots 用 `set -- $line`（无引号）解析 manifest 行 → 该 glob 会先经**宿主 cwd
-#   路径展开（pathname expansion）**。宿主 hook（session_start_mirror_sync.sh L42）`cd $TOP`（仓库根）后运行，
-#   而仓库根**存在** wiki-background/ 目录（C 源背景库约定：research-<topic> 语料落仓库根 wiki-background/）→
-#   `wiki-background/*` 会被展开成 `wiki-background/README.md ...` 实文件、glob 退化为具体文件名 → 嵌套
-#   corpus 路径 wiki-background/harness-lessons/*.md 分类 miss → **corpus 永不铺到消费方**（正是本卡要防的 FR 失败）。
-#   既有全部 machine glob 前缀（components/scripts/skills/rules/agents/config…）在仓库根**均不存在**同名目录，
-#   故不被展开——设计隐含依赖「glob 前缀不与宿主 cwd 目录撞名」。harness-lessons/ 前缀 harness 独占、仓库根
-#   无此子目录，故不被展开、分类稳定命中。（根治需在 lib 加 `set -f` 禁展开，属机制层、不在本卡范围。）
+# ⚠ glob 精确到 harness-lessons/ 子目录（非泛 `wiki-background/*`）= defense-in-depth（非机制必需 · 已根治）：
+#   历史缺陷（v0.9.0 前 · failure-record-005）：mirror_sync_classify/scan_roots 曾用 `set -- $line`（无引号）
+#   解析 manifest 行 → glob 先经**宿主 cwd 路径展开（pathname expansion）**。宿主 hook
+#   （session_start_mirror_sync.sh `cd $TOP` 仓库根）运行、而仓库根**存在** wiki-background/ 目录（C 源背景库
+#   约定：research-<topic> 语料落仓库根 wiki-background/）→ 泛 `wiki-background/*` 被展开成实文件、glob 退化为
+#   具体文件名 → 嵌套 corpus 路径 wiki-background/harness-lessons/*.md 分类 miss → corpus 永不铺到消费方。
+#   ✅ 已在解析层根治（v0.9.0/v0.9.1 · failure-record-005）：两处解析改 `read -r <<< "$line"`（quoted
+#   here-string）→ 分词天然不做 pathname expansion，泛 glob 现已可安全使用、不再依赖「glob 前缀不与宿主 cwd
+#   目录撞名」这一隐含前提。本条 harness-lessons/ 精确前缀因此**降级为 defense-in-depth**（缩小 scan_roots
+#   遍历面 + 避免误纳邻近 corpus），而非规避 cwd 撞名的机制必需。解析层非展开的回归护栏见
+#   tests/test_sync_manifest_glob_parse_guard.py（解析层若回退 `set -- $line` 即转红）。
 # 同族第三次复发防线（承 config/* §）：未来新增背景库 corpus 目录须同步在本 manifest 扩一条对应 glob
 #   （同理精确到该 corpus 子目录避 cwd 撞名），否则镜像不铺、消费方缺 corpus、依赖它的旁路检索静默空转。
 machine  wiki-background/harness-lessons/*
@@ -84,9 +86,10 @@ machine  wiki-background/harness-lessons/*
 #   原生分发、非 .harness 镜像管理，现 .harness/hooks/ 仅此 1 个镜像文件），故此为真缺口：须显式登记方能
 #   把该单 hook 铺到消费方 .harness/hooks/。
 # ⚠ 禁 `hooks/*` 泛 glob（两重原因）：① 泛 glob 会把 plugin hooks/ 下全部 ~20 个 hook 误分类 machine、
-#   全量扫进消费方 .harness/hooks/（越界污染——那些 hook 无 .harness 镜像、也不该有）；② 泛 glob 有宿主 cwd
-#   pathname-expansion 撞名退化风险（wiki-background/* 教训）。精确单文件路径（无 `*` 元字符）双免：
-#   read -r 分词天然不展开 → 不被 cwd 撞名；scan_roots 取 dirname=hooks 遍历、classify 仅该文件精确命中、
+#   全量扫进消费方 .harness/hooks/（越界污染——那些 hook 无 .harness 镜像、也不该有 · 此为**当前主因**）；
+#   ② 历史上泛 glob 曾有宿主 cwd pathname-expansion 撞名退化面（wiki-background/* 教训 · 解析层 v0.9.0/v0.9.1
+#   `read -r` 已根治，见上方 wiki-background 段；现仅作 defense-in-depth 考量、非活跃风险）。精确单文件路径
+#   （无 `*` 元字符）双免：read -r 分词天然不展开 → 不被 cwd 撞名；scan_roots 取 dirname=hooks 遍历、classify 仅该文件精确命中、
 #   同目录其余 hook 落 unclassified 不铺。既有 `HARNESS_CONFIG.yaml.template`（下方 opt-out 区）即精确单文件登记先例。
 # skill/命令类新增（skills/transcript-archive/** · commands/transcript-archive-enable.md）按 manifest 既有
 #   分类惯例**已被现况 glob 覆盖、无须新增条目**：skills/transcript-archive/** 由上方 `machine skills/*` 覆盖

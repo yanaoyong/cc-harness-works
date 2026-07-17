@@ -23,6 +23,24 @@ if ! type harness_state_root >/dev/null 2>&1; then
   }
 fi
 
+# _pbg_worktree_hint —— 缺口③ 降级态（fix-governance-hook-gaps · T2 · UQ-3=a · spike 判定降级态）：
+# EnterWorktree 后 UserPromptSubmit hook 结构性不 fire（平台绑定 · 授权台账无法落盘 · 见 failure-record-008），
+# 授权门证据类 fail-closed 会误拦真实授权。本函数在 cwd 处于 linked git worktree（git-dir 绝对路径 != git-common-dir
+# 绝对路径）时，向证据类 deny 的 stderr 追加 worktree-aware 可行动提示，把 ad-hoc 绕行固化为可审计降级；
+# 非 worktree（含非 git 目录 / git 不可用）返回空串（既有 deny 文案零回归）。仅在 deny 路径调用（低频·git ≤2）。
+_pbg_worktree_hint() {
+  local _gd _cd _gd_abs _cd_abs
+  _gd="$(git -C "$PWD" rev-parse --git-dir 2>/dev/null || true)"
+  [ -n "$_gd" ] || return 0
+  _cd="$(git -C "$PWD" rev-parse --git-common-dir 2>/dev/null || true)"
+  [ -n "$_cd" ] || return 0
+  _gd_abs="$(cd "$_gd" 2>/dev/null && pwd -P || true)"
+  _cd_abs="$(cd "$_cd" 2>/dev/null && pwd -P || true)"
+  [ -n "$_gd_abs" ] && [ -n "$_cd_abs" ] || return 0
+  [ "$_gd_abs" = "$_cd_abs" ] && return 0
+  printf ' [worktree-aware] 检出当前为 git worktree 会话——这是 UserPromptSubmit 断供的已知场景（worktree 会话 UPS 结构性不 fire → 授权台账无法落盘 · failure-record-008）。若用户授权确已真实给出，确认后以唯一合法旁路前缀 `HARNESS_GIT_GUARD_BYPASS=1 ` 重试本命令，并在卡 summary「例外与豁免」节记录授权原话 + worktree 误拦根因（可审计降级 · 非无解释的裸 fail-closed）。'
+}
+
 # ---- 读取 payload：bash 内建 read（零子进程；空 stdin / EOF 容错）----
 payload=""
 IFS= read -r -d '' payload || true
@@ -372,11 +390,43 @@ if [[ -n "$_authz_gate" ]]; then
   # AC-10.b 证据类失败：台账缺失/不可读/非普通文件（结构性不可解析）→ 视同无证据 → fail-closed。
   # `-f` 前置校验（不止 `-r`）：目录/设备/管道等占位路径对 `-r` 恒真、但后续 while-read 会崩，
   # 故须显式要求"存在→普通可读文件，否则 deny"（feat-hitl-authz-hardening v2 · unit_test 发现②）。
-  if [[ ! -f "$_ledger" || ! -r "$_ledger" ]]; then
+  #
+  # 【缺口② 跨-session union · fix-governance-hook-gaps · T2 · UQ-2=a · MF-3 ⑤⑥】：sid 中途轮换后授权台账落
+  # 旧 sid 文件（user_prompts_<oldsid>.log），门按新 sid 查询 user_prompts_<newsid>.log 无记录 → 证据类误拦
+  # 真实授权（实撞 transcript-archive sid 8b399ebf→8df7191d）。修法 = 台账**定位**从「仅当前 sid 文件」放宽为
+  # 「同 STATE_DIR 内跨全部 user_prompts_*.log 文件 union」。union 只放松台账**定位**，内容判据（授权词 AND
+  # gate 词、时间窗、CONSUMED 去重、PR 号一致、伪授权前缀过滤）一律不放松（见下 union 窗口语义 ⑤ + CONSUMED ⑥）。
+  #
+  # ① 结构性异常先判（保留既有 B6 语义）：当前 sid 台账路径存在但非普通可读文件（目录/设备占位）→ 证据类
+  #    fail-closed（防以坏台账占位绕过）。此判在 union 发现之前，语义与 feat-hitl-authz-hardening v2 一字不变。
+  if [[ -e "$_ledger" && ( ! -f "$_ledger" || ! -r "$_ledger" ) ]]; then
     if [[ "$_authz_gate" == "merge" ]]; then _hint='授权/同意/approve + 合并/merge'; else _hint='授权/同意/approve + 推送/push/PR'; fi
-    echo "[harness:pre_bash_guard] 阻断（授权硬门·${_authz_gate}）：本会话用户授权台账缺失/不可读/非普通文件（台账异常：$_ledger）。证据类失败按 fail-closed 拒绝（避免删/坏台账绕过授权门）。恢复：确认 UserPromptSubmit hook（user_prompt_state_inject.sh）正常落盘后，请用户显式输入含「${_hint}」的授权语再重试。" >&2
+    echo "[harness:pre_bash_guard] 阻断（授权硬门·${_authz_gate}）：本会话用户授权台账非普通可读文件（台账异常：$_ledger）。证据类失败按 fail-closed 拒绝（避免坏台账占位绕过授权门）。恢复：确认 UserPromptSubmit hook（user_prompt_state_inject.sh）正常落盘后，请用户显式输入含「${_hint}」的授权语再重试。$(_pbg_worktree_hint)" >&2
     exit 2
   fi
+  # ② union 文件发现：收集同 STATE_DIR 内全部可读 user_prompts_*.log（含当前 sid 与轮换前旧 sid）。
+  #    `-f && -r` 逐文件过滤（glob 未命中回退字面 pattern 亦被过滤）；bash 3.2 兼容：索引遍历、不展开 "${arr[@]}"。
+  _ledger_files=()
+  for _lf in "$_sdir"/user_prompts_*.log; do
+    [[ -f "$_lf" && -r "$_lf" ]] && _ledger_files+=("$_lf")
+  done
+  _nlf=${#_ledger_files[@]}
+  # ③ 证据类 fail-closed（缺口②后语义不变）：跨全部 sid 文件后仍无任何可读授权台账 → deny。
+  if [[ $_nlf -eq 0 ]]; then
+    if [[ "$_authz_gate" == "merge" ]]; then _hint='授权/同意/approve + 合并/merge'; else _hint='授权/同意/approve + 推送/push/PR'; fi
+    echo "[harness:pre_bash_guard] 阻断（授权硬门·${_authz_gate}）：本会话用户授权台账缺失/不可读（STATE_DIR：$_sdir · 跨全部 user_prompts_*.log 均无可读台账）。证据类失败按 fail-closed 拒绝（避免删/坏台账绕过授权门）。恢复：确认 UserPromptSubmit hook（user_prompt_state_inject.sh）正常落盘后，请用户显式输入含「${_hint}」的授权语再重试。$(_pbg_worktree_hint)" >&2
+    exit 2
+  fi
+  # ④ union 态判定（MF-3 ⑤）：仅有当前 sid 单文件（无轮换）→ 退化路径保留既有 rank≤5 OR age≤3600 向后兼容；
+  #    一旦发现异 sid 文件（轮换）→ union 态：跨文件后「最近 5 条」rank 无良定义，故**仅凭 60 分钟时间窗**、
+  #    禁用 rank 分支（否则 >60 分钟 stale 授权经 rank 绕过时间约束 = FALSE ALLOW）；时间解析失败 → fail-closed
+  #    不放行该条（安全侧，不退回 rank）。判定见下方匹配循环 _ok_win。
+  _union_mode=0
+  _ufi=0
+  while [[ $_ufi -lt $_nlf ]]; do
+    [[ "${_ledger_files[$_ufi]}" != "$_ledger" ]] && _union_mode=1
+    _ufi=$((_ufi + 1))
+  done
 
   _now_epoch="$(date +%s 2>/dev/null || echo 0)"
 
@@ -654,27 +704,37 @@ if [[ -n "$_authz_gate" ]]; then
     _cmd_pr="${BASH_REMATCH[1]}"                             # ② 独立 `#N`（与修前逐字节一致 · 零回归）
   fi
 
-  # 收集 prompt 条目（排除 CONSUMED 记录行）、本 gate 已消费时间戳、本 gate 已消费 prompt_id 集
+  # 收集 prompt 条目（排除 CONSUMED 记录行）、本 gate 已消费时间戳、本 gate 已消费 prompt_id 集。
+  # 【缺口② · MF-3 ⑥】CONSUMED 去重跨文件：union 须收集**全部 sid 文件**的 entries 与 CONSUMED——否则 sid A
+  #   已消费的授权在 sid B 扫描时因看不到 A 的 CONSUMED 而**跨文件双消费 = FALSE ALLOW**；去重键 _ets（秒级 ts）
+  #   跨 sid 文件非全局唯一，碰撞方向 = 过度拦截（把不同条误判为已消费 → 拒绝，安全侧）、可接受。CONSUMED **写入**
+  #   仍落当前 sid 文件（下方消费段 $_ledger · append-only · 不改落盘契约，后续 union 读端跨文件即可见）。
   _entries=()
   _consumed=""
   _consumed_pids=""
   # 防御第二层（发现②）：显式初始化 _ln，杜绝 set -u 下 read 从未赋值（如台账异常/首轮读失败）时
   # `[[ -n "$_ln" ]]` 触发 "unbound variable" 致 exit 1（非受控退出码）。与上方 -f 前置校验双保险。
   _ln=""
-  while IFS= read -r _ln || [[ -n "$_ln" ]]; do
-    [[ -z "$_ln" ]] && continue
-    if [[ "$_ln" == "CONSUMED "* ]]; then
-      # CONSUMED <gate> <now-ts> <被消费条目 ts> [<prompt_id>]（prompt_id 为 S-1 新增末字段·旧记录无该字段兼容）
-      if [[ "$_ln" == "CONSUMED $_authz_gate "* ]]; then
-        _ets_c="$(printf '%s' "$_ln" | awk '{print $4}')"
-        [[ -n "$_ets_c" ]] && _consumed="${_consumed}|${_ets_c}|"
-        _pid_c="$(printf '%s' "$_ln" | awk '{print $5}')"
-        [[ -n "$_pid_c" ]] && _consumed_pids="${_consumed_pids}|${_pid_c}|"
+  _cfi=0
+  while [[ $_cfi -lt $_nlf ]]; do
+    _cf="${_ledger_files[$_cfi]}"
+    _cfi=$((_cfi + 1))
+    _ln=""
+    while IFS= read -r _ln || [[ -n "$_ln" ]]; do
+      [[ -z "$_ln" ]] && continue
+      if [[ "$_ln" == "CONSUMED "* ]]; then
+        # CONSUMED <gate> <now-ts> <被消费条目 ts> [<prompt_id>]（prompt_id 为 S-1 新增末字段·旧记录无该字段兼容）
+        if [[ "$_ln" == "CONSUMED $_authz_gate "* ]]; then
+          _ets_c="$(printf '%s' "$_ln" | awk '{print $4}')"
+          [[ -n "$_ets_c" ]] && _consumed="${_consumed}|${_ets_c}|"
+          _pid_c="$(printf '%s' "$_ln" | awk '{print $5}')"
+          [[ -n "$_pid_c" ]] && _consumed_pids="${_consumed_pids}|${_pid_c}|"
+        fi
+        continue
       fi
-      continue
-    fi
-    _entries+=("$_ln")
-  done < "$_ledger"
+      _entries+=("$_ln")
+    done < "$_cf"
+  done
 
   # S-1 幂等短路：本 gate 已有同 prompt_id 的 CONSUMED → 本轮已授权，放行（双注册双触发的第二次不误拒、不重复消费）。
   # 仅当 _prompt_id 非空时启用（空 prompt_id 退化为既有单次消费语义，杜绝跨轮空==空误放行）。
@@ -693,9 +753,15 @@ if [[ -n "$_authz_gate" ]]; then
     _rank=$(( _n - _i ))   # 1 = 最新
     _ets="$(printf '%s' "$_entry" | awk -F'\t' '{print $1}')"
     _etext="${_entry#*$'\t'}"
-    # 窗口并集：最近 5 条 OR 60 分钟内（时间解析失败则仅凭条数窗口，优雅降级）
+    # 窗口判定（MF-3 ⑤ · 缺口② union 态语义定死）：
+    #   · 单 sid 无轮换退化路径（_union_mode=0）：保留既有「最近 5 条 OR 60 分钟内」并集（时间解析失败仅凭
+    #     条数窗口优雅降级）——向后兼容，既有守护零回归。
+    #   · union 态（_union_mode=1，发现异 sid 文件）：跨文件后 rank 无良定义 → **仅凭 60 分钟时间窗**、**禁用
+    #     rank 分支**（下行 rank 判定被 `_union_mode -eq 0` 短路）；时间解析失败（_now_epoch==0 / date 失败 /
+    #     _ets 空）→ _ok_win 恒 0 → **fail-closed 不放行该条**（安全侧，不退回 rank）。否则 >60 分钟 stale 授权
+    #     会经 rank 分支绕过时间约束 = 安全门 FALSE ALLOW。
     _ok_win=0
-    [[ $_rank -le 5 ]] && _ok_win=1
+    if [[ $_union_mode -eq 0 && $_rank -le 5 ]]; then _ok_win=1; fi   # rank≤5 仅退化路径生效（union 态禁用）
     if [[ $_ok_win -eq 0 && "$_now_epoch" != "0" && -n "$_ets" ]]; then
       _eep="$(date -d "$_ets" +%s 2>/dev/null || true)"
       if [[ -n "$_eep" ]]; then
@@ -731,7 +797,7 @@ if [[ -n "$_authz_gate" ]]; then
   # 台账在场但无未消费的匹配授权 → 规则命中 fail-closed（AC-10.a）
   if [[ "$_authz_gate" == "merge" ]]; then _hint='授权/同意/approve 与 合并/merge'; else _hint='授权/同意/approve 与 推送/push/PR'; fi
   [[ -n "$_cmd_pr" ]] && _hint="${_hint}，且 PR 号 #${_cmd_pr} 一致"
-  echo "[harness:pre_bash_guard] 阻断（授权硬门·${_authz_gate}）：本会话台账近期（最近 5 条或 60 分钟内）无未消费的用户授权痕迹。改正：请用户显式输入授权语（须同时含 ${_hint}）后重试；单条授权对同一 gate 仅可消费一次。" >&2
+  echo "[harness:pre_bash_guard] 阻断（授权硬门·${_authz_gate}）：本会话台账近期（最近 5 条或 60 分钟内）无未消费的用户授权痕迹。改正：请用户显式输入授权语（须同时含 ${_hint}）后重试；单条授权对同一 gate 仅可消费一次。$(_pbg_worktree_hint)" >&2
   exit 2
 fi
 
