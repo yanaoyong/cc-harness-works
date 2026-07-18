@@ -29,10 +29,12 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import fnmatch
 import gzip
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -55,6 +57,9 @@ ENV_SOURCE_ROOT = "HARNESS_TRANSCRIPT_SOURCE_ROOT"
 DEFAULT_STATE_HOME = Path.home() / ".claude" / "harness-transcript-archive"
 DEFAULT_SOURCE_ROOT = Path.home() / ".claude" / "projects"
 DEFAULT_LOCK_STALE_SECONDS = 600
+
+# 源根项目目录默认排除模式（大小写敏感 · fnmatch 风格）。
+DEFAULT_SOURCE_EXCLUDES = ["*tmp*", "*fixture*", "*acceptance*"]
 
 # 附属目录（AC-7）——仅 subagents/ 与 workflows/ 纳入归档（tool-results/ 不入）。
 AUX_SUBDIRS = ("subagents", "workflows")
@@ -283,6 +288,13 @@ class Ctx:
         self.hard_gate_allow_fingerprints: frozenset[str] = frozenset(
             cfg.get("hard_gate_allow_fingerprints") or []
         )
+        # 源根项目目录排除模式：默认清单 + config.json source_exclude 追加（追加不覆盖，
+        # 防止消费者意外放行 fixture 类目录）。
+        user_excludes = cfg.get("source_exclude") or []
+        if not isinstance(user_excludes, list):
+            warn("source_exclude 类型不是 list[str]，忽略用户追加项")
+            user_excludes = []
+        self.source_excludes: list[str] = list(DEFAULT_SOURCE_EXCLUDES) + list(user_excludes)
         # 机器本地水位（不入归档仓 · HITL-2 多机修订）
         self.watermarks_path = state_home / "watermarks.json"
         self.watermarks: dict = load_watermarks(self.watermarks_path)
@@ -446,6 +458,22 @@ def apply_retention(ctx: Ctx) -> None:
 # 单会话提取（热层 + 冷层 + 附属目录 AC-7）
 # --------------------------------------------------------------------------- #
 
+def _resolve_archive_prefix(project: str, base_dir: Path) -> tuple[str, Path]:
+    """根据 project 目录名解析主项目名与归档仓前缀目录（热层/冷层/附属目录均可作为 base）。
+
+    返回 ``(main_project, archive_prefix_dir)``：
+
+    * 不含 ``--claude-worktrees-`` 分隔符时，主项目 = ``project``，前缀目录 = ``base_dir / project``。
+    * 含分隔符时按首次出现切分：前段 = 主项目名，后段（含可能残留的分隔符）= worktree 段；
+      前缀目录 = ``base_dir / main_project / "_worktrees" / wt_segment``。
+    """
+    sep = "--claude-worktrees-"
+    if sep not in project:
+        return project, base_dir / project
+    main_project, wt_segment = project.split(sep, 1)
+    return main_project, base_dir / main_project / "_worktrees" / wt_segment
+
+
 def _split_complete(raw_bytes: bytes) -> tuple[bytes, int]:
     """取完整行部分（以 \\n 结尾）；尾部不完整行丢弃、下轮补齐（AC-4）。
 
@@ -487,15 +515,17 @@ def process_session(ctx: Ctx, project: str, session_id: str, jsonl_path: Path, i
     )
     for w in lean.warnings:
         warn(f"{session_id}: {w}")
-    meta = transcript_index.extract_session_meta(raw_lines, project, session_id)
+
+    main_project, archive_prefix = _resolve_archive_prefix(project, ctx.archive_dir)
+    meta = transcript_index.extract_session_meta(raw_lines, main_project, session_id)
     yyyymm = (meta.get("date") or "")[:7] or "unknown"  # date 空 → unknown（路径内容确定，禁 mtime）
 
-    hot_path = ctx.archive_dir / project / yyyymm / f"{session_id}.lean.jsonl"
+    hot_path = archive_prefix / yyyymm / f"{session_id}.lean.jsonl"
     _atomic_write_text(hot_path, "\n".join(lean.lines) + "\n")
 
     # --- 附属目录 lean（AC-7：subagents/ 与 workflows/）---
     aux_src = jsonl_path.parent / session_id
-    session_dir = ctx.archive_dir / project / yyyymm / session_id
+    session_dir = archive_prefix / yyyymm / session_id
     if aux_src.is_dir():
         for sub in AUX_SUBDIRS:
             sub_src = aux_src / sub
@@ -511,12 +541,13 @@ def process_session(ctx: Ctx, project: str, session_id: str, jsonl_path: Path, i
                 out = session_dir / rel.parent / f"{aux_file.stem}.lean.jsonl"
                 _atomic_write_text(out, "\n".join(aux_lean.lines) + "\n")
 
-    # --- 冷层（raw gz + 附属 tar.gz，确定性）---
-    cold_gz = ctx.cold_dir / project / f"{session_id}.jsonl.gz"
+    # --- 冷层（raw gz + 附属 tar.gz，确定性 · 与热层 layout 一致）---
+    _, cold_prefix = _resolve_archive_prefix(project, ctx.cold_dir)
+    cold_gz = cold_prefix / f"{session_id}.jsonl.gz"
     _write_gz(cold_gz, complete)
     cold_sync_artifact(ctx, cold_gz)  # 落盘成功后方同步（AC-8b）
     if aux_src.is_dir():
-        cold_tar = ctx.cold_dir / project / f"{session_id}-aux.tar.gz"
+        cold_tar = cold_prefix / f"{session_id}-aux.tar.gz"
         if _write_aux_tar(cold_tar, aux_src):
             cold_sync_artifact(ctx, cold_tar)
 
@@ -525,14 +556,19 @@ def process_session(ctx: Ctx, project: str, session_id: str, jsonl_path: Path, i
     return True
 
 
-def iter_sessions(source_root: Path):
-    """遍历源根下各项目的 *.jsonl 会话（确定性排序）。"""
+def iter_sessions(source_root: Path, excludes: list[str]):
+    """遍历源根下各项目的 *.jsonl 会话（确定性排序）。
+
+    命中 excludes 中任一 fnmatch 模式的项目目录被整体跳过，不产生任何 yield。
+    """
     if not source_root.is_dir():
         return
     for project_dir in sorted(source_root.iterdir()):
         if not project_dir.is_dir():
             continue
         project = project_dir.name  # 源根下目录名原样（不转义还原 · 确定性优先）
+        if any(fnmatch.fnmatch(project, pat) for pat in excludes):
+            continue
         for jsonl in sorted(project_dir.glob("*.jsonl")):
             yield project, jsonl.stem, jsonl
 
@@ -544,17 +580,38 @@ def iter_sessions(source_root: Path):
 def rebuild_index(ctx: Ctx) -> None:
     """从归档仓 lean 产物行重建 index.tsv + by-instance/（派生物全量重写、幂等）。
 
-    仅扫主会话 lean（``<project>/<yyyy-mm>/<session>.lean.jsonl`` · 3 层深 glob）；附属目录 lean
-    （4+ 层深）不构成独立会话、不进索引。meta 从 lean 行重建（信封 gitBranch/timestamp + tool_use
-    路径两信号在 lean 存活），故与源无关、单独运行幂等。
+    仅扫主会话 lean（``<project>/<yyyy-mm>/<session>.lean.jsonl`` 或
+    ``<project>/_worktrees/<wt>/<yyyy-mm>/<session>.lean.jsonl``）；附属目录 lean
+    与 by-instance/ 派生产物不构成独立会话、不进索引。meta 从 lean 行重建（信封
+    gitBranch/timestamp + tool_use 路径两信号在 lean 存活），故与源无关、单独运行幂等。
     """
     archive = ctx.archive_dir
     metas: list[dict] = []
     lean_rel: dict[str, str] = {}
-    for lean_file in sorted(archive.glob("*/*/*.lean.jsonl")):  # glob `*` 不匹配 .git/.state（点开头）
+    for lean_file in sorted(archive.rglob("*.lean.jsonl")):
         rel = lean_file.relative_to(archive)
-        project = rel.parts[0]
+        # 跳过隐藏目录（.git/.state 等）与 by-instance 派生产物。
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        if "by-instance" in rel.parts:
+            continue
+        # 主会话路径形态校验（AC-5 · R-3）：仅两种合法形态——
+        #   <project>/<yyyy-mm>/<session>.lean.jsonl            (3 段)
+        #   <project>/_worktrees/<wt>/<yyyy-mm>/<session>.lean.jsonl (5 段)
+        # 例如 project/2026-07/sess/subagents/2026-07/nested.lean.jsonl
+        # 这类嵌套 yyyy-mm 的附属 lean 必须被排除，不能误作主会话索引。
+        if len(rel.parts) not in (3, 5):
+            continue
+        if len(rel.parts) == 5 and rel.parts[1] != "_worktrees":
+            continue
+        # 主会话判定：父目录为 yyyy-mm 或 unknown，且文件名为 <session>.lean.jsonl。
+        parent_name = lean_file.parent.name
+        if parent_name != "unknown" and not re.fullmatch(r"\d{4}-\d{2}", parent_name):
+            continue
         session_id = lean_file.name[: -len(".lean.jsonl")]
+        if not session_id:
+            continue
+        project = rel.parts[0]
         lines = lean_file.read_text(encoding="utf-8", errors="replace").splitlines()
         meta = transcript_index.extract_session_meta(lines, project, session_id)
         metas.append(meta)
@@ -664,7 +721,7 @@ def _run_extract_pipeline(ctx: Ctx, ignore_watermark: bool, do_push: bool) -> in
 
     # 2. 主提取（热层 + 冷层 + 附属目录）
     processed = 0
-    for project, session_id, jsonl in iter_sessions(ctx.source_root):
+    for project, session_id, jsonl in iter_sessions(ctx.source_root, ctx.source_excludes):
         if process_session(ctx, project, session_id, jsonl, ignore_watermark):
             processed += 1
 
@@ -726,6 +783,67 @@ def cmd_index(ctx: Ctx, args) -> int:
     return 0
 
 
+def cmd_migrate_layout(ctx: Ctx, args) -> int:
+    """将归档仓顶级 worktree 目录迁移到 <main_project>/_worktrees/<wt>/ 布局（本地单 commit）。
+
+    仅操作 archive_dir，不读 source_root、不推进水位。迁移前要求工作树干净，命中硬门则 fail-closed。
+    """
+    # 迁移前强校验工作树干净：避免非 lean 脏变更被 git add -A 一并打包进迁移 commit。
+    porcelain = run_git(ctx.archive_dir, ["status", "--porcelain"]).stdout.strip()
+    if porcelain:
+        warn("工作树不干净，先 commit/stash 后再运行 migrate-layout")
+        return 7
+
+    # 迁移前硬门：commit_if_changed 内 git add -A 会暂存一切脏产物；工作树不干净净入则危险。
+    findings = _hard_gate_before_commit(ctx)
+    if findings:
+        _warn_hard_gate_findings(findings)
+        return HARD_GATE_FAIL_RC
+
+    archive = ctx.archive_dir
+    to_move: list[tuple[str, str, str]] = []  # (old_top, main_project, wt_segment)
+    for entry in sorted(archive.iterdir()):
+        if not entry.is_dir():
+            continue
+        name = entry.name
+        # 跳过隐藏/系统目录与 by-instance 派生产物。
+        if name.startswith(".") or name == "by-instance":
+            continue
+        main_project, prefix_dir = _resolve_archive_prefix(name, archive)
+        expected_old = archive / name
+        if prefix_dir == expected_old:
+            # 不含分隔符，已是主项目布局，无需迁移。
+            continue
+        # 解析出 wt_segment（_resolve_archive_prefix 已保证 prefix = archive/main/_worktrees/wt）。
+        wt_segment = prefix_dir.name
+        to_move.append((name, main_project, wt_segment))
+
+    if not to_move:
+        log("migrate-layout: 无顶级 worktree 目录需迁移")
+        print(json.dumps({"mode": "migrate-layout", "moved": 0}), flush=True)
+        return 0
+
+    for old_top, main_project, wt_segment in to_move:
+        target_parent = archive / main_project / "_worktrees"
+        target = target_parent / wt_segment
+        if target.exists():
+            warn(
+                f"migrate-layout: 目标已存在，拒绝覆盖/合并: {target.relative_to(archive)}"
+            )
+            return 6
+        target_parent.mkdir(parents=True, exist_ok=True)
+        run_git(archive, ["mv", "--", str(old_top), str(target)])
+        log(f"migrate-layout: git mv {old_top} {target.relative_to(archive)}")
+
+    rebuild_index(ctx)
+    committed = commit_if_changed(
+        archive, f"transcript-archive migrate-layout: {len(to_move)} project(s)"
+    )
+    log(f"migrate-layout: moved={len(to_move)} committed={committed}")
+    print(json.dumps({"mode": "migrate-layout", "moved": len(to_move)}), flush=True)
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
@@ -745,6 +863,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     bp = sub.add_parser("backfill", help="首次全量提取（忽略水位的 sync）")
     bp.add_argument("--push", action="store_true", help="commit 后推送归档仓（显式开关）")
+
+    mp = sub.add_parser(
+        "migrate-layout",
+        help="将归档仓顶级 worktree 目录迁移到 <main_project>/_worktrees/<wt>/ 布局",
+    )
+    mp.set_defaults(push=False)
 
     return p
 
@@ -783,7 +907,12 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     try:
-        dispatch = {"sync": cmd_sync, "index": cmd_index, "backfill": cmd_backfill}
+        dispatch = {
+            "sync": cmd_sync,
+            "index": cmd_index,
+            "backfill": cmd_backfill,
+            "migrate-layout": cmd_migrate_layout,
+        }
         return dispatch[args.command](ctx, args)
     finally:
         release_lock(fd)

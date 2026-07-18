@@ -67,8 +67,18 @@ bash <定位到的>/enable_archive.sh git@github.com:<you>/claude-transcript-arc
 | `denylist_path` | str | `""`（可空） | 消费方可扩脱敏 denylist 文件路径；逐条 `re.compile`，编译失败条目 skip+warning 不中止 |
 | `cold_sync_cmd` | str | `""`（空=仅本机） | 冷层落盘成功后执行的**非本机同步命令**（rclone/scp/对象存储 CLI）；空则冷层仅留本机 |
 | `lock_stale_seconds` | int | `600` | flock 锁龄阈值（秒）；持锁者超此时长视为卡死 → 告警上抛 |
+| `source_exclude` | list[str] | `[]` | 追加 fnmatch 排除模式，与内置默认 `*tmp*` / `*fixture*` / `*acceptance*` 共同生效；追加不覆盖默认清单 |
 
 > 手动改 config.json 后无需重启；下一次 `sync` 即读新值。改键值时保持类型正确（bool/int/str）。
+
+## 3.1 全机单例归档心智模型
+
+归档仓是**全机单例**，不是按项目隔离的：
+
+1. **`STATE_HOME` / `SOURCE_ROOT` 全机唯一**：`STATE_HOME` 缺省为 `~/.claude/harness-transcript-archive`，`SOURCE_ROOT` 缺省为 `~/.claude/projects`。消费方通过 `CLAUDE_PLUGIN_ROOT` 定位到同一套脚本，同一台机器上所有 Claude Code 项目共用同一归档仓。
+2. **任何项目触发 sync 都归档全机会话**：在任意项目里跑 `sync` / `backfill`，脚本都会扫描全机 `SOURCE_ROOT` 下的全部项目会话并写入同一归档仓。不存在“按项目归档到不同仓”的设计。
+3. **禁止按项目设置 `HARNESS_TRANSCRIPT_ARCHIVE_HOME`**：若在不同项目/目录分别设置该环境变量，同一批会话会被复制到多个归档仓，造成**真·重复归档**，后续去重、清理与索引都会错乱。
+4. **硬门伪命中核实 → 放行 SOP**：`_hard_gate_before_commit` 可能把一次性整理脚本误判为风险。核实为误报后，把其 `fingerprint` 追加写入 `config.json` 的 `hard_gate_allow_fingerprints` 列表即可放行；该列表是追加而非覆盖。
 
 ## 4. 启用后的 opt-in 后续步骤（均手动、按需开启）
 
@@ -147,6 +157,21 @@ cat <定位到的>/scripts/transcript_archive_cron.sample
 
   **不受控介质加密由你自行在命令中套 `age` / `gpg`**（例：`cold_sync_cmd` 内先 `age -r <key>` 再上传）——**插件本体保持纯 stdlib、不调用任何加密二进制、不产出加密态**。
 - **cold_retention_days**：冷层保留窗口（0=永不回收）；`lock_stale_seconds`：并发锁龄阈值（缺省 600s）。
+
+### 4.6 `migrate-layout` 子命令（一次性 layout 整理）
+
+如果你之前使用早期版本归档，仓根下可能存在形如 `<project>--claude-worktrees-<wt>` 的 worktree 顶级目录。运行一次 `migrate-layout` 可把这类目录整理为 `<project>/_worktrees/<wt>/`：
+
+```bash
+python3 <定位到的>/transcript_archive.py migrate-layout
+```
+
+- **仅操作归档仓**：不碰 `source_root`、水位文件与冷层。
+- **仅本地 commit**：不会 `push` 到远端；整理结果留在本地归档仓，供你审阅后再决定是否推送。
+- **执行前要求工作树干净**：若硬门命中，请先核实误报并把 `fingerprint` 追加到 `hard_gate_allow_fingerprints`。
+- **建议先备份**：脚本内部使用 `git mv` 保留历史，但整理前仍建议先对归档仓做一次快照或 push 当前状态。
+
+执行后会重建 `index.tsv` 与 `by-instance/`；二次运行幂等。
 
 ## 5. 未启用 = 零副作用（AC-5 保证）
 
