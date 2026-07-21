@@ -33,6 +33,11 @@
     },
     {
       "type": "file",
+      "source": ".harness/scripts/sync_public_marketplace.sh",
+      "destination": ".harness/scripts/sync_public_marketplace.sh"
+    },
+    {
+      "type": "file",
       "source": ".github/workflows/plugin-distribution.yml",
       "destination": ".github/workflows/plugin-distribution.yml"
     },
