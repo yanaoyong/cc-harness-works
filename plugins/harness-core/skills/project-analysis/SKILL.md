@@ -1,5 +1,6 @@
 ---
 name: project-analysis
+description: 对目标仓库进行可验证的结构、分层与依赖方向摸底
 trigger: 按需（阶段1 之前或并行；Owner 判定需要结构摸底时）
 inputs: 仓库根目录、工程结构规则、可选 Wiki/历史变更
 outputs: project_analysis_report.md（可选 module_map.md）

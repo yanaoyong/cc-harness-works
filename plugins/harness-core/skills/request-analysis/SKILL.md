@@ -1,5 +1,6 @@
 ---
 name: request-analysis
+description: 将用户需求转化为结构化规格与可执行任务计划
 trigger: 阶段1 需求分析
 inputs: 用户需求描述、相关 Wiki/历史变更
 outputs: spec.md、tasks.md

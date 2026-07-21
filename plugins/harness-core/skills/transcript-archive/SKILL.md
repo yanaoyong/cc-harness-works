@@ -1,5 +1,6 @@
 ---
 name: transcript-archive
+description: 校验私有归档仓并以 opt-in 方式启用会话 transcript 归档
 trigger: 用户显式调用 `/transcript-archive-enable`，或表达"启用会话 transcript 归档 / 配置归档仓"意图
 inputs: 用户提供的 GitHub 私有归档仓 remote URL（必填，无缺省）
 outputs: 校验结论（fail-closed）+ `<STATE_HOME>/config.json`（enabled 开关 + 冻结键）+ 后续 opt-in 步骤引导

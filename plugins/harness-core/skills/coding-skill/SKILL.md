@@ -1,5 +1,6 @@
 ---
 name: coding-skill
+description: 按已批准的规格与任务计划逐层实现代码并记录编码证据
 trigger: 阶段3 编码实现
 inputs: 已 APPROVED 的 spec.md / tasks.md
 outputs: 代码、coding_report_vN.md

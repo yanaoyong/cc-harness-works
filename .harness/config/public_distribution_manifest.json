@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "type": "file",
+      "source": ".claude-plugin/marketplace.json",
+      "destination": ".claude-plugin/marketplace.json"
+    },
+    {
+      "type": "directory",
+      "source": "plugins/harness-core",
+      "destination": "plugins/harness-core"
+    },
+    {
+      "type": "directory",
+      "source": "plugins/harness-profile-python",
+      "destination": "plugins/harness-profile-python"
+    },
+    {
+      "type": "directory",
+      "source": "plugins/harness-profile-react-vite",
+      "destination": "plugins/harness-profile-react-vite"
+    },
+    {
+      "type": "file",
+      "source": ".harness/config/public_distribution_manifest.json",
+      "destination": ".harness/config/public_distribution_manifest.json"
+    },
+    {
+      "type": "file",
+      "source": ".harness/scripts/check_plugin_distribution.py",
+      "destination": ".harness/scripts/check_plugin_distribution.py"
+    },
+    {
+      "type": "file",
+      "source": ".github/workflows/plugin-distribution.yml",
+      "destination": ".github/workflows/plugin-distribution.yml"
+    },
+    {
+      "type": "file",
+      "source": "docs/guides/plugin-distribution-guide.md",
+      "destination": "docs/guides/plugin-distribution-guide.md"
+    },
+    {
+      "type": "file",
+      "source": "LICENSE",
+      "destination": "LICENSE"
+    },
+    {
+      "type": "generated",
+      "destination": "README.md",
+      "generator": "sync_public_marketplace.sh#public-readme"
+    }
+  ],
+  "directory_exclusions": {
+    "names": [
+      "test",
+      "tests",
+      "__pycache__"
+    ],
+    "file_globs": [
+      "*.pyc",
+      "*.env"
+    ]
+  },
+  "permission_policy": {
+    "preserve_source_modes": true,
+    "generated_file_mode": "0644"
+  },
+  "readme_policy": {
+    "strategy": "generated",
+    "entry_destination": "README.md",
+    "generator": "sync_public_marketplace.sh#public-readme"
+  }
+}

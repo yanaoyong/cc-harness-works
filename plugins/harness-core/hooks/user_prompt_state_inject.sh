@@ -14,17 +14,12 @@
 #   - list_flows.sh 不可用 → 输出降级行，保留 header 与动作段
 #   - 输出量受控：--brief、PASSED 不显示、L 注解 ≤3 条（D-01 §4.3）
 #
-# L 豁免持久化（D-12L §4.2 · HITL-1 P-1 决议）：
-#   - 状态文件：.harness/state/l_exemptions.jsonl（append-only · 纳入 git 跟踪 · 每行一条 JSON）
-#   - 行格式：{"timestamp":"<ISO8601>","class":"L1|L2|L3|L4","scope_summary":"<≤80字符>","source":"user-declared|owner-auto"}
-#   - hook 解析用户 prompt 开头 `[流程豁免 · <类别>]` 自动追加 user-declared 记录
-#     （类别映射：咨询→L1 / 文档非业务→L2 / 远程同步→L3 / 临时调试→L4；4 类之外不追加 + stderr warning）
-#   - L3 owner-auto 由 Owner 按以下约定以一条 Bash 命令追加（与 hook 写入格式一致）：
-#       printf '{"timestamp":"%s","class":"L3","scope_summary":"%s","source":"owner-auto"}\n' \
-#         "$(date '+%Y-%m-%dT%H:%M:%S%z')" "git pull origin main" >> .harness/state/l_exemptions.jsonl
-#   - 测试可注入：环境变量 L_EXEMPTIONS_FILE 覆写路径（默认真实路径），测试不污染审计文件
-#   - 注解段恒输出（即使无记录显示"（无）"）—— D-12L §6.1 以"块缺少该注解段"作为 hook 失效检测信号
-#   - 实现依赖：纯 grep/sed/awk，无 jq 依赖（与基线 5 个 hook 一致）
+# L 路由记录与当前轮候选（chore-l-implicit-routing-20260720）：
+#   - hook 只读当前 UserPromptSubmit 原始 prompt，候选固定 L1/L2/L3/L4/NONE/AMBIGUOUS；不读取或臆造尚未发生的 Owner 响应。
+#   - source 固定 user-declared（合法显式标签）或 hook-inferred（无标签且高置信唯一命中）。
+#   - append-only 历史只登记实际选择的显式标签；隐式候选仅在本轮注入中呈现，单轮不传染。
+#   - 状态文件：.harness/state/l_exemptions.jsonl；行格式 source 仅 user-declared。
+#   - 测试可用 L_EXEMPTIONS_FILE 覆写路径；实现保持纯 shell 工具、无 jq 强依赖。
 set -uo pipefail
 
 # scope_summary 按"字符"截断（D-12L §4.2 ≤80 字符）需 UTF-8 locale；
@@ -130,12 +125,13 @@ l_sanitize_scope() {
 }
 
 l_append_exemption() {
-  # $1=class(L1..L4) $2=scope_summary $3=source(user-declared|owner-auto)
-  local f
+  # $1=class(L1..L4) $2=scope_summary $3=source（缺省 user-declared）；只持久化真实显式声明。
+  local f source="${3:-user-declared}"
+  [ "$source" = "user-declared" ] || return 0
   f="$(l_file_path)"
   mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
-  printf '{"timestamp":"%s","class":"%s","scope_summary":"%s","source":"%s"}\n' \
-    "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" "$(l_sanitize_scope "$2")" "$3" >> "$f" 2>/dev/null || true
+  printf '{"timestamp":"%s","class":"%s","scope_summary":"%s","source":"user-declared"}\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" "$(l_sanitize_scope "$2")" >> "$f" 2>/dev/null || true
 }
 
 l_read_recent() {
@@ -182,22 +178,144 @@ l_render_line() {
   printf -- '- %s · %s · %s · source: %s' "$ts" "$(l_class_label "$cls")" "${scope:-—}" "$src"
 }
 
-l_handle_prompt() {
-  # $1 = 用户 prompt（自 stdin JSON 提取）；开头 `[流程豁免 · <类别>]` → 追加 user-declared 记录
-  local prompt="$1" category cls scope
-  case "$prompt" in
-    "[流程豁免 · "*) ;;
-    *) return 0 ;;
-  esac
-  category="$(printf '%s' "$prompt" | sed -n 's/^\[流程豁免 · \([^]]*\)\].*/\1/p')"
-  [ -n "$category" ] || return 0
-  cls="$(l_map_category "$category")"
-  if [ -z "$cls" ]; then
-    printf 'warning: [harness:prompt_state] L 豁免类别「%s」不在 4 类封闭枚举（咨询/文档非业务/远程同步/临时调试）内，未登记；4 类之外默认进 K 流程（D-12L §5.3）\n' "$category" >&2
+L_CURRENT_CANDIDATE="NONE"
+L_CURRENT_SOURCE="hook-inferred"
+L_CURRENT_ARTIFACT_INTENT="NONE"
+L_CURRENT_FINAL_ROUTE="K"
+L_CURRENT_REFUSAL_REASON="NONE"
+
+l_artifact_intent_from_prompt() {
+  # 明确写入优先：逐分句判定独立、执行性的写入动作，不能让前置否定/咨询吞掉后续转折。
+  # 输出是最终裁决函数接受的封闭枚举：NONE/NONBUSINESS_MARKDOWN/BUSINESS_WRITE。
+  local lower="$1" clauses clause
+  lower="$(printf '%s' "$lower" | tr '[:upper:]' '[:lower:]')"
+  # 合法显式标签只声明类别，不参与工件词法；B1 仍检查标签后的真实请求正文。
+  lower="$(printf '%s' "$lower" | sed 's/^\[流程豁免[[:space:]]*·[^]]*\][[:space:]]*//')"
+
+  # 把转折、追加和顺序连接词切成独立分句。每个分句分别排除否定/问法/示例，任一剩余
+  # 分句同时具有写入动作与明确业务对象即 BUSINESS_WRITE（显式 L 与隐式 L 共用此信号）。
+  clauses="$(printf '%s' "$lower" | sed -E 's/(但是|不过|然而|另外|同时|然后|顺便|并且|之后|再者|但)/\
+/g; s/[，。；,;]/\
+/g')"
+  while IFS= read -r clause; do
+    [ -n "$clause" ] || continue
+    if ! printf '%s' "$clause" | grep -qE '(新增|修改|删除|写入|落盘|修复|实现|更新|生成|创建|改|写).*(src(/|[[:space:]]|$)|config(/|[[:space:]]|$)|代码|脚本|实现|业务配置|配置文件|文件|功能|bug|缺陷|readme|[^[:space:]]*\.md)|(src(/|[[:space:]]|$)|config(/|[[:space:]]|$)|代码|脚本|实现|业务配置|配置文件|文件|功能|bug|缺陷|readme|[^[:space:]]*\.md).*(新增|修改|删除|写入|落盘|修复|实现|更新|生成|创建|改|写)|(跑|执行|测试).*(并|后).*(修复|改|修改).*(失败|问题)' 2>/dev/null; then
+      continue
+    fi
+    # 否定必须约束本分句中的动作；切句后不会影响“但是/然后”等后续独立写入。
+    if printf '%s' "$clause" | grep -qE '(不要|不用|不需|无需|别|禁止)([[:space:]]*[^[:space:]，。；,;]*){0,3}[[:space:]]*(新增|修改|删除|写入|落盘|修复|实现|更新|生成|创建|改|写)|不产生.*(写入|落盘|修改|新增)' 2>/dev/null; then
+      continue
+    fi
+    # 问法、仅供展示的示例和对命令文字的引用不构成实际落盘请求。
+    if printf '%s' "$clause" | grep -qE '(如何|怎么|怎样|能否|是否).*(新增|修改|删除|写入|落盘|修复|实现|更新|生成|创建|改|写)|(示例代码|代码示例|举例|样例).*(不要|不用|不需|无需|仅|只).*(落盘|写入|修改|新增|生成)|(引用|解释|说明|分析).*(写入|落盘|修改|新增).*(命令|语句|文字)' 2>/dev/null; then
+      continue
+    fi
+    if printf '%s' "$clause" | grep -qE 'readme|(^|[[:space:]/])[^[:space:]]*\.md([[:space:]]|$)' 2>/dev/null \
+       && printf '%s' "$clause" | grep -qE 'typo|错别字|拼写|措辞|排版|链接' 2>/dev/null \
+       && ! printf '%s' "$clause" | grep -qE '代码|业务|配置|脚本|spec|需求|架构|设计|契约|实现|新增|删除' 2>/dev/null; then
+      printf 'NONBUSINESS_MARKDOWN'
+    else
+      printf 'BUSINESS_WRITE'
+    fi
+    return 0
+  done <<< "$clauses"
+  printf 'NONE'
+}
+
+l_final_route_decide() {
+  # 纯函数：只消费封闭枚举，不读写 state，不调用候选分类器。
+  # $1=candidate $2=requested(K/ASK/L1..L4) $3=artifact_intent。
+  local candidate="${1:-}" requested="${2:-}" artifact="${3:-}"
+  L_CURRENT_FINAL_ROUTE="K"
+  L_CURRENT_REFUSAL_REASON="NONE"
+
+  case "$candidate" in L1|L2|L3|L4|NONE|AMBIGUOUS) ;; *) L_CURRENT_REFUSAL_REASON="INVALID_CANDIDATE"; return 2 ;; esac
+  case "$requested" in L1|L2|L3|L4|K|ASK) ;; *) L_CURRENT_REFUSAL_REASON="INVALID_REQUESTED_DECISION"; return 2 ;; esac
+  case "$artifact" in NONE|NONBUSINESS_MARKDOWN|BUSINESS_WRITE) ;; *) L_CURRENT_REFUSAL_REASON="INVALID_ARTIFACT_INTENT"; return 2 ;; esac
+
+  # B1 最优先，显式标签也不可绕过；L2 只例外允许纯非业务 Markdown。
+  if [ "$artifact" = "BUSINESS_WRITE" ] || { [ "$artifact" = "NONBUSINESS_MARKDOWN" ] && [ "$candidate" != "L2" ]; }; then
+    L_CURRENT_FINAL_ROUTE="K"
+    L_CURRENT_REFUSAL_REASON="B1_ARTIFACT_WRITE_REQUIRES_K"
     return 0
   fi
-  scope="$(printf '%s' "$prompt" | sed 's/^\[[^]]*\][[:space:]]*//')"
-  l_append_exemption "$cls" "${scope:-（未复述范围）}" "user-declared"
+
+  case "$requested" in
+    K) L_CURRENT_FINAL_ROUTE="K"; return 0 ;;
+    ASK) L_CURRENT_FINAL_ROUTE="ASK"; return 0 ;;
+  esac
+  case "$candidate" in
+    NONE)
+      L_CURRENT_FINAL_ROUTE="K"; L_CURRENT_REFUSAL_REASON="CANDIDATE_NONE_CANNOT_WIDEN_TO_L" ;;
+    AMBIGUOUS)
+      L_CURRENT_FINAL_ROUTE="ASK"; L_CURRENT_REFUSAL_REASON="CANDIDATE_AMBIGUOUS_CANNOT_WIDEN_TO_L" ;;
+    "$requested") L_CURRENT_FINAL_ROUTE="$candidate" ;;
+    L1|L2|L3|L4)
+      L_CURRENT_FINAL_ROUTE="K"; L_CURRENT_REFUSAL_REASON="L_CLASS_MISMATCH_CANNOT_RECLASSIFY" ;;
+  esac
+  return 0
+}
+
+l_route_test_cli() {
+  # 机械测试接口：bash user_prompt_state_inject.sh --l-route-test CANDIDATE REQUESTED ARTIFACT_INTENT PROMPT
+  # ARTIFACT_INTENT 可为 AUTO（仅 CLI 先从原 prompt 生成受控信号）；不执行 main，故不碰真实 state。
+  local candidate="${1:-}" requested="${2:-}" artifact="${3:-}" prompt="${4:-}" rc=0
+  if [ "$artifact" = "AUTO" ]; then artifact="$(l_artifact_intent_from_prompt "$prompt")"; fi
+  l_final_route_decide "$candidate" "$requested" "$artifact" || rc=$?
+  printf 'candidate=%s\nrequested_decision=%s\nartifact_intent=%s\nfinal_route=%s\nrefusal_reason=%s\n' \
+    "$candidate" "$requested" "$artifact" "$L_CURRENT_FINAL_ROUTE" "$L_CURRENT_REFUSAL_REASON"
+  return "$rc"
+}
+
+l_classify_prompt() {
+  # 高精度唯一命中：组合意图、引用标签、否定表达一律不隐式放宽。
+  # 结果写全局 L_CURRENT_CANDIDATE/L_CURRENT_SOURCE，候选恒属于六值封闭集。
+  local prompt="$1" category cls body lower hits=0 candidate="NONE"
+  L_CURRENT_CANDIDATE="NONE"
+  L_CURRENT_SOURCE="hook-inferred"
+  L_CURRENT_ARTIFACT_INTENT="$(l_artifact_intent_from_prompt "$prompt")"
+
+  category="$(printf '%s' "$prompt" | sed -n 's/^\[流程豁免 · \([^]]*\)\].*/\1/p')"
+  if [ -n "$category" ]; then
+    cls="$(l_map_category "$category")"
+    if [ -z "$cls" ]; then
+      printf 'warning: [harness:prompt_state] L 豁免类别「%s」不在 4 类封闭枚举内，候选=NONE；4 类之外默认进 K 流程\n' "$category" >&2
+      return 0
+    fi
+    body="$(printf '%s' "$prompt" | sed 's/^\[[^]]*\][[:space:]]*//')"
+    L_CURRENT_CANDIDATE="$cls"
+    L_CURRENT_SOURCE="user-declared"
+    l_append_exemption "$cls" "${body:-（未复述范围）}"
+    return 0
+  fi
+
+  lower="$(printf '%s' "$prompt" | tr '[:upper:]' '[:lower:]')"
+  # 标签仅被引用/讨论，或存在显式否定，不作为声明或隐式命中。
+  if printf '%s' "$prompt" | grep -qE '\[流程豁免[[:space:]]*·' 2>/dev/null; then return 0; fi
+  if printf '%s' "$lower" | grep -qE '不要(走|用|算|当).*l[1-4]|不(是|要|算).*流程豁免|非(咨询|文档非业务|远程同步|临时调试)' 2>/dev/null; then return 0; fi
+
+  # 修改/产出组合会破坏 B1；即便同时含 L 关键词也不得隐式豁免。
+  if printf '%s' "$lower" | grep -qE '并且|然后|顺便|同时|之后.*(改|写|实现|新增|删除|提交|推送|部署)|改(代码|配置|脚本|业务|spec|设计)|新增|实现|修复.*(bug|缺陷)' 2>/dev/null; then
+    if printf '%s' "$lower" | grep -qE '解释|咨询|readme|\.md|git (pull|fetch)|拉下|跑一下|调试|查一下' 2>/dev/null; then L_CURRENT_CANDIDATE="AMBIGUOUS"; fi
+    return 0
+  fi
+
+  if printf '%s' "$lower" | grep -qE '^(请)?(解释|说明|分析|查一下|看一下|读一下|帮我看|这段.*做什么|为什么|哪里)' 2>/dev/null; then candidate="L1"; hits=$((hits+1)); fi
+  if printf '%s' "$lower" | grep -qE '(typo|错别字|拼写|措辞|排版|链接)' 2>/dev/null \
+     && printf '%s' "$lower" | grep -qE '(^|[[:space:]/])[^[:space:]]*\.md([[:space:]]|$)|readme' 2>/dev/null \
+     && ! printf '%s' "$lower" | grep -qE '业务语义|需求|spec|架构|设计实质|契约' 2>/dev/null; then candidate="L2"; hits=$((hits+1)); fi
+  if printf '%s' "$lower" | grep -qE '^(请)?[[:space:]]*(git[[:space:]]+(pull|fetch)|拉下远程|拉取远程|同步远程|checkout[[:space:]]+已有|切到已有分支)' 2>/dev/null \
+     && ! printf '%s' "$lower" | grep -qE '并|然后|之后|再|改|实现|提交|push|merge' 2>/dev/null; then candidate="L3"; hits=$((hits+1)); fi
+  if printf '%s' "$lower" | grep -qE '^(请)?(跑一下|试一下|执行一下|调试一下|看下日志|查看日志|检查状态|验证一下|grep |ls |git status|跑现有)' 2>/dev/null \
+     && ! printf '%s' "$lower" | grep -qE '改|写|新增|删除|修复|生成|提交|push|merge' 2>/dev/null; then candidate="L4"; hits=$((hits+1)); fi
+
+  if [ "$hits" -eq 1 ]; then L_CURRENT_CANDIDATE="$candidate";
+  elif [ "$hits" -gt 1 ]; then L_CURRENT_CANDIDATE="AMBIGUOUS";
+  fi
+}
+
+l_handle_prompt() {
+  l_classify_prompt "$1"
 }
 
 # ---------- 注入渲染 ----------
@@ -208,11 +326,13 @@ emit_header() {
 }
 
 emit_actions() {
+  printf '%s\n' "  当前 prompt 的 L 路由候选：${L_CURRENT_CANDIDATE} · source: ${L_CURRENT_SOURCE}"
+  printf '%s\n' "  当前 prompt 的工件意图：${L_CURRENT_ARTIFACT_INTENT}（最终路由裁决的 B1 受控输入）"
   printf '%s\n' "  动作（按用户 prompt 隐式/显式选择流程实例 / 通道）："
-  printf '%s\n' "    · 修改类请求（业务代码 / spec / 设计文档实质内容）→ 识别属于哪个 M/K 活跃实例 + 推进；或建新实例（无活跃实例时第一步 = 复制 _TEMPLATE/ 建变更目录并初始化 summary.md，进入阶段 1）"
-  printf '%s\n' "    · 非修改类（4 类豁免：L1 咨询·读代码 / L2 文档非业务 / L3 远程同步 / L4 临时调试）→ 走 L 通道，响应开头声明 \`[流程豁免 · <类别>]\` 并复述范围"
-  printf '%s\n' "      · L1/L2/L4 须用户显式声明；L3 远程同步可由 Owner 主动声明（触发 3 条件见 12-L 通道定义 §3）"
-  printf '%s\n' "    · 4 类之外 = 不豁免 · 默认进 K 流程（B3 类型有限枚举 · 见 12-L 通道定义 §5.3）"
+  printf '%s\n' "    候选只供本轮 Owner 单向裁决，单轮不传染。"
+  printf '%s\n' "    · user-declared 或高置信 hook-inferred L1/L2/L3/L4 → Owner 可维持该类，或收紧为 K/询问；首响应仍声明最终类别与范围，无需要求用户重复标签"
+  printf '%s\n' "    · NONE/AMBIGUOUS → 禁止 Owner 放宽为隐式 L；按 K 流程或询问。修改/产出触发 B1 时立即回 K"
+  printf '%s\n' "    · 四类封闭枚举 + B1 产物升格 / B2 单轮不传染 / B3 类型有限；hook 失效时自动识别关闭，仅保留用户人工显式标签应急"
 }
 
 emit_l_section() {
@@ -769,9 +889,14 @@ main() {
     stdin_raw="$(cat 2>/dev/null || true)"
   fi
   if [ -n "$stdin_raw" ]; then
-    prompt_val="$(printf '%s' "$stdin_raw" | tr -d '\n\r' \
-      | grep -o '"prompt"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -1 \
-      | sed -E 's/^"prompt"[[:space:]]*:[[:space:]]*"//; s/"$//')"
+    if command -v jq >/dev/null 2>&1; then
+      prompt_val="$(printf '%s' "$stdin_raw" | jq -r '.prompt // .user_prompt // empty' 2>/dev/null || true)"
+    fi
+    if [ -z "$prompt_val" ]; then
+      prompt_val="$(printf '%s' "$stdin_raw" | tr -d '\n\r' \
+        | grep -o '"prompt"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -1 \
+        | sed -E 's/^"prompt"[[:space:]]*:[[:space:]]*"//; s/"$//')"
+    fi
   fi
   if [ -n "$prompt_val" ]; then
     l_handle_prompt "$prompt_val" || true
@@ -838,7 +963,13 @@ main() {
   exit 0
 }
 
-# source 守卫（tasks 评审 v1 #1）：被 source 时仅定义函数（供单测），不执行主流程
+# source 守卫（tasks 评审 v1 #1）：被 source 时仅定义函数（供单测），不执行主流程。
+# --l-route-test 是无副作用机械接口：不读 stdin、不解析/写入真实 state、不渲染 UserPromptSubmit 块。
 if [[ "${BASH_SOURCE[0]:-}" == "$0" ]]; then
+  if [ "${1:-}" = "--l-route-test" ]; then
+    shift
+    l_route_test_cli "${1:-}" "${2:-}" "${3:-}" "${4:-}"
+    exit $?
+  fi
   main
 fi

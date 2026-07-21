@@ -1,5 +1,6 @@
 ---
 name: unit-test-ci
+description: 执行阶段8测试并按可程序化三条件门禁记录 CI 结论
 trigger: 阶段8 CI 验证
 inputs: 已推送代码、阶段5/6 单测产出
 outputs: ci_result/ci_result.md

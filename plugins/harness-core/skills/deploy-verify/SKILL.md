@@ -1,5 +1,6 @@
 ---
 name: deploy-verify
+description: 按人工确认的环境参数完成部署并验证关键交付路径
 trigger: 阶段9 部署验证
 inputs: 阶段8 CI 通过、HITL-4 确认的部署参数
 outputs: deployment/deployment_report.md

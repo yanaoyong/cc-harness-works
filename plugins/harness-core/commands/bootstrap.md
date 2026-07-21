@@ -27,16 +27,34 @@ echo "SCRIPT=${SCRIPT:-NOT_FOUND}"
   - **pid 存活** → 后台 bootstrap（B 路径）正在执行，先告知我并建议等待其完成（日志：同目录 `bootstrap.log`），不要并行重跑；
   - **pid 已死** → 属残留哨兵（后台任务曾被强杀/重启中断，收尾清理未执行），告知我后**可直接继续本流程重跑**（脚本全幂等；session-start 挂载下会话也会自动清除该残留），不要被残留哨兵引导停下等待。
 
-## ② 零写入探测（`--report-only`）
+## ② 零安装、零写入探测（`--report-only`）
 
 ```bash
 bash "$SCRIPT" --report-only
 ```
 
-stdout 固定三行机读格式：`engine=ready|missing` / `index=ready|missing` / `wiki=ready|missing`（exit 0 = 三全，exit 20 = 有缺项）。
+该模式只读取当前仓库与进程环境，不安装组件、不创建目录或哨兵、不写配置，也不修改或持久化 `PATH`。stdout 固定输出以下机读键：
 
-- **三项全 ready（exit 0）** → 直接告知我「已全就绪，无需 bootstrap」，结束（可顺带跑一次 `--report-only` 之外的 `cg doctor` 佐证，不强制）。
-- **有缺项（exit 20）** → 进入步骤 ③。
+```text
+engine=ready|missing
+index=ready|missing
+wiki=ready|missing
+command.git=available|degraded
+command.python3=available|degraded
+command.ruff=available|degraded
+command.npx=available|degraded
+degraded_policy=missing commands do not block core flows that do not depend on them
+```
+
+- 全部 `ready` / `available`：exit 0。
+- 任一项缺失：exit 20。`command.*=degraded` 表示该命令不可用；它只影响依赖该命令的步骤，不阻断不依赖它的 Harness 核心流程。
+- **三项全 ready 且命令均 available（exit 0）** → 直接告知我「已全就绪，无需 bootstrap」，结束。若要只读佐证 Codegraph，请使用安装态完整路径：
+  ```bash
+  "${CLAUDE_PLUGIN_ROOT}/components/codegraph/bin/cg" doctor
+  "${CLAUDE_PLUGIN_ROOT}/components/codegraph/bin/cg" status
+  ```
+  本仓开发态对应 `plugins/harness-core/components/codegraph/bin/cg doctor|status`。路径缺失或命令返回非零时，按原退出码报告 degraded；不得自动安装、改 `PATH` 或掩盖结果。
+- **有缺项（exit 20）** → 先按上述键逐项转述，再进入步骤 ③。
 
 ## ③ 安装前展示将执行的动作（等待我确认 · 不得跳过）
 

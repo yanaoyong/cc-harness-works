@@ -45,7 +45,7 @@ _pbg_worktree_hint() {
 payload=""
 IFS= read -r -d '' payload || true
 
-# ---- 快速路径（AC-7①）：payload 不含 git 且不含危险模式粗筛关键词 → 纯内建判断，立即放行 ----
+# ---- 快速路径（AC-7①）：payload 不含受治理关键词且不含危险模式粗筛关键词 → 纯内建判断，立即放行 ----
 # 注：`gh` 关键词纳入粗筛（feat-hitl-authz-hardening T2）——`gh pr merge` 不含 `git` 子串，
 # 若不纳入会被此处提前放行、绕过下方 merge 授权硬门。
 # 注：`stage7_push` 关键词纳入粗筛（feat-stage-exec-scripts T2′）——`bash .harness/scripts/stage7_push.sh …`
@@ -54,7 +54,8 @@ IFS= read -r -d '' payload || true
 # summary.md 的命令（sed -i/重定向/tee/cp/mv…）既不含上列关键词也不含 `git`，若不纳入会被此处提前放行、
 # 绕过下方规则 C 的 summary.md 治理硬门。**不含 `summary.md` 子串的 payload 照旧零外部子进程立即放行**
 # （AC-1.1 快速路径零回归：仅在既有关键词并集**追加** summary.md，其余关键词与短路语义不变、性能预算不动）。
-if [[ "$payload" != *git* && "$payload" != *gh* && "$payload" != *rm* && "$payload" != *sudo* \
+if [[ "$payload" != *git* && "$payload" != *gh* && "$payload" != *claude* && "$payload" != *wiki-ingest-cheap* \
+   && "$payload" != *rm* && "$payload" != *sudo* \
    && "$payload" != *mkfs* && "$payload" != *chmod* && "$payload" != *':()'* \
    && "$payload" != *stage7_push* && "$payload" != *summary.md* && "$payload" != */dev/sd* ]]; then
   exit 0
@@ -67,6 +68,268 @@ if command -v jq >/dev/null 2>&1; then
 fi
 if [[ -z "$cmd" ]]; then
   cmd="$payload"
+fi
+
+# ---- 规则 D：Claude CLI 子 Agent 派遣治理（chore-l-implicit-routing · T2 · AC-B1~B5）----
+# 只观察 Bash 工具收到的顶层 command；组件 wrapper 内部 exec 的 claude 不会再次触发本 hook。
+# 识别保守限定为可靠浅层形态：赋值/env/command/timeout/nice 等前缀，以及一层 sh|bash -c。
+# 未执行待检命令；这里只做词元化、registry 校验与 realpath 边界验证。
+_pbg_d_registry=""
+_pbg_d_components=""
+_pbg_d_registry_state="missing"
+_pbg_d_ids='|'
+_pbg_d_entries='|'
+
+_pbg_d_select_environment() {
+  local _top _core
+  _top="$(harness_state_root)"
+  if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
+    _pbg_d_registry="${CLAUDE_PLUGIN_ROOT}/config/allowed_cli_backends.tsv"
+    _pbg_d_components="${CLAUDE_PLUGIN_ROOT}/components"
+    return 0
+  fi
+  _core="$_top/plugins/harness-core"
+  if [[ -f "$_core/.claude-plugin/plugin.json" && -d "$_core/components" ]]; then
+    _pbg_d_registry="$_core/config/allowed_cli_backends.tsv"
+    _pbg_d_components="$_core/components"
+  else
+    _pbg_d_registry="$_top/.harness/config/allowed_cli_backends.tsv"
+    _pbg_d_components="$_top/.harness/components"
+  fi
+}
+
+_pbg_d_load_registry() {
+  local _line _id _entry _purpose _extra
+  _pbg_d_select_environment
+  [[ -f "$_pbg_d_registry" && -r "$_pbg_d_registry" ]] || { _pbg_d_registry_state="missing"; return 1; }
+  _pbg_d_registry_state="valid"
+  while IFS= read -r _line || [[ -n "$_line" ]]; do
+    [[ -z "$_line" || "$_line" == \#* ]] && continue
+    IFS=$'\t' read -r _id _entry _purpose _extra <<< "$_line"
+    if [[ -z "$_id" || -z "$_entry" || -z "$_purpose" || -n "$_extra" \
+       || "$_id" == *$'\t'* || "$_entry" == *$'\t'* || "$_purpose" == *$'\t'* \
+       || ! "$_id" =~ ^[A-Za-z0-9._-]+$ \
+       || "$_entry" != components/* || "$_entry" == /* \
+       || "$_entry" == *'/../'* || "$_entry" == '../'* || "$_entry" == *'/..' ]]; then
+      _pbg_d_registry_state="damaged"
+      return 1
+    fi
+    case "$_pbg_d_ids" in *"|$_id|"*) _pbg_d_registry_state="damaged"; return 1 ;; esac
+    case "$_pbg_d_entries" in *"|$_entry|"*) _pbg_d_registry_state="damaged"; return 1 ;; esac
+    _pbg_d_ids="${_pbg_d_ids}${_id}|"
+    _pbg_d_entries="${_pbg_d_entries}${_entry}|"
+  done < "$_pbg_d_registry"
+  [[ "$_pbg_d_entries" != '|' ]] || { _pbg_d_registry_state="damaged"; return 1; }
+  return 0
+}
+
+_pbg_d_strip_outer_quote() {
+  local _v="$1"
+  case "$_v" in '"'*|"'"*) _v="${_v#?}" ;; esac
+  case "$_v" in *'"'|*"'") _v="${_v%?}" ;; esac
+  printf '%s\n' "$_v"
+}
+
+_pbg_d_is_assignment() {
+  local _token="$1" _name
+  [[ "$_token" == *=* ]] || return 1
+  _name="${_token%%=*}"
+  [[ "$_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]
+}
+
+# 保守词法器：只拆分命令词元，不执行输入。支持单双引号与反斜杠转义；拒绝会触发
+# shell 求值/组合的未引用变量、命令替换、glob 和控制操作符。输出写入全局 _pbg_d_words。
+_pbg_d_tokenize() {
+  local _text="$1" _i=0 _n _ch _quote="" _word="" _started=0
+  _pbg_d_words=()
+  _n=${#_text}
+  while (( _i < _n )); do
+    _ch="${_text:_i:1}"
+    if [[ -z "$_quote" ]]; then
+      case "$_ch" in
+        [[:space:]])
+          if (( _started )); then _pbg_d_words+=("$_word"); _word=""; _started=0; fi ;;
+        "'") _quote="single"; _started=1 ;;
+        '"') _quote="double"; _started=1 ;;
+        \\)
+          _i=$((_i + 1))
+          (( _i < _n )) || return 1
+          _word+="${_text:_i:1}"; _started=1 ;;
+        '$'|'`'|'*'|'?'|'['|'|'|'&'|';'|'('|')'|'<'|'>') return 1 ;;
+        *) _word+="$_ch"; _started=1 ;;
+      esac
+    elif [[ "$_quote" == "single" ]]; then
+      if [[ "$_ch" == "'" ]]; then _quote=""; else _word+="$_ch"; fi
+    else
+      case "$_ch" in
+        '"') _quote="" ;;
+        \\)
+          _i=$((_i + 1))
+          (( _i < _n )) || return 1
+          _word+="${_text:_i:1}" ;;
+        '$'|'`') return 1 ;;
+        *) _word+="$_ch" ;;
+      esac
+    fi
+    _i=$((_i + 1))
+  done
+  [[ -z "$_quote" ]] || return 1
+  if (( _started )); then _pbg_d_words+=("$_word"); fi
+  return 0
+}
+
+_pbg_d_classify() {
+  local _text="$1" _tok _base _i=0 _n _duration
+  _pbg_d_kind="ordinary"
+  _pbg_d_head=""
+  _pbg_d_print=0
+  _pbg_d_parse_failed=0
+  if ! _pbg_d_tokenize "$_text"; then
+    _pbg_d_parse_failed=1
+    return 0
+  fi
+  _n=${#_pbg_d_words[@]}
+  while (( _i < _n )); do
+    _tok="${_pbg_d_words[_i]}"
+    if _pbg_d_is_assignment "$_tok"; then _i=$((_i + 1)); continue; fi
+    case "$_tok" in
+      env)
+        _i=$((_i + 1))
+        while (( _i < _n )); do
+          _tok="${_pbg_d_words[_i]}"
+          if _pbg_d_is_assignment "$_tok"; then _i=$((_i + 1)); continue; fi
+          case "$_tok" in
+            --) _i=$((_i + 1)); break ;;
+            -i|--ignore-environment|-0|--null) _i=$((_i + 1)) ;;
+            -u|-C|--unset|--chdir)
+              _i=$((_i + 1)); (( _i < _n )) || { _pbg_d_parse_failed=1; return 0; }; _i=$((_i + 1)) ;;
+            --unset=*|--chdir=*) _i=$((_i + 1)) ;;
+            -*) _pbg_d_parse_failed=1; return 0 ;;
+            *) break ;;
+          esac
+        done
+        continue ;;
+      command)
+        _i=$((_i + 1))
+        while (( _i < _n )); do
+          case "${_pbg_d_words[_i]}" in
+            --) _i=$((_i + 1)); break ;;
+            -p|-v|-V) _i=$((_i + 1)) ;;
+            -*) _pbg_d_parse_failed=1; return 0 ;;
+            *) break ;;
+          esac
+        done
+        continue ;;
+      timeout)
+        _i=$((_i + 1)); _duration=""
+        while (( _i < _n )); do
+          _tok="${_pbg_d_words[_i]}"
+          case "$_tok" in
+            --) _i=$((_i + 1)); break ;;
+            --foreground|--preserve-status|--verbose) _i=$((_i + 1)) ;;
+            -s|-k|--signal|--kill-after)
+              _i=$((_i + 1)); (( _i < _n )) || { _pbg_d_parse_failed=1; return 0; }; _i=$((_i + 1)) ;;
+            -s?*|-k?*|--signal=*|--kill-after=*) _i=$((_i + 1)) ;;
+            -*) _pbg_d_parse_failed=1; return 0 ;;
+            *) break ;;
+          esac
+        done
+        (( _i < _n )) || { _pbg_d_parse_failed=1; return 0; }
+        _duration="${_pbg_d_words[_i]}"
+        [[ -n "$_duration" ]] || { _pbg_d_parse_failed=1; return 0; }
+        _i=$((_i + 1)); continue ;;
+      stdbuf)
+        _i=$((_i + 1))
+        while (( _i < _n )); do
+          _tok="${_pbg_d_words[_i]}"
+          case "$_tok" in
+            --) _i=$((_i + 1)); break ;;
+            -i|-o|-e|--input|--output|--error)
+              _i=$((_i + 1)); (( _i < _n )) || { _pbg_d_parse_failed=1; return 0; }; _i=$((_i + 1)) ;;
+            -i?*|-o?*|-e?*|--input=*|--output=*|--error=*) _i=$((_i + 1)) ;;
+            -*) _pbg_d_parse_failed=1; return 0 ;;
+            *) break ;;
+          esac
+        done
+        continue ;;
+      nice)
+        _i=$((_i + 1))
+        while (( _i < _n )); do
+          _tok="${_pbg_d_words[_i]}"
+          case "$_tok" in
+            --) _i=$((_i + 1)); break ;;
+            -n|--adjustment)
+              _i=$((_i + 1)); (( _i < _n )) || { _pbg_d_parse_failed=1; return 0; }; _i=$((_i + 1)) ;;
+            --adjustment=*|-n?*|-[0-9]*) _i=$((_i + 1)) ;;
+            -*) _pbg_d_parse_failed=1; return 0 ;;
+            *) break ;;
+          esac
+        done
+        continue ;;
+    esac
+    break
+  done
+  (( _i < _n )) || return 0
+  _pbg_d_head="${_pbg_d_words[_i]}"
+  _base="${_pbg_d_head##*/}"
+  _i=$((_i + 1))
+  if [[ "$_base" == "claude" ]]; then
+    while (( _i < _n )); do
+      _tok="${_pbg_d_words[_i]}"
+      [[ "$_tok" == "-p" || "$_tok" == "--print" ]] && _pbg_d_print=1
+      _i=$((_i + 1))
+    done
+    if [[ $_pbg_d_print -eq 1 ]]; then _pbg_d_kind="claude-dispatch"; fi
+  elif [[ "$_base" == "wiki-ingest-cheap" ]]; then
+    _pbg_d_kind="backend-entry"
+  fi
+  return 0
+}
+
+# 一层可靠 shell 包壳：只把 -c 后的引号载荷交给同一顶层分类器，不递归观察组件内部。
+_pbg_d_outer="$cmd"
+_pbg_d_classify "$_pbg_d_outer"
+if [[ "$_pbg_d_parse_failed" == "1" && "$cmd" =~ (^|[[:space:]])([^[:space:]]*/)?claude[[:space:]]+([^[:space:]]+[[:space:]]+)*(-p|--print)([[:space:]]|$) ]]; then
+  _pbg_d_kind="claude-dispatch"
+fi
+if [[ "$_pbg_d_kind" == "ordinary" && "$cmd" =~ (^|[[:space:]])(bash|sh)[[:space:]]+([^[:space:]]+[[:space:]]+)*-c[[:space:]]+([\"\'])(.*) ]]; then
+  _pbg_d_inner="${BASH_REMATCH[5]}"
+  case "$_pbg_d_inner" in *'"'|*"'") _pbg_d_inner="${_pbg_d_inner%?}" ;; esac
+  _pbg_d_classify "$_pbg_d_inner"
+  if [[ "$_pbg_d_parse_failed" == "1" && "$_pbg_d_inner" =~ (^|[[:space:]])([^[:space:]]*/)?claude[[:space:]]+([^[:space:]]+[[:space:]]+)*(-p|--print)([[:space:]]|$) ]]; then
+    _pbg_d_kind="claude-dispatch"
+  fi
+fi
+
+if [[ "$_pbg_d_kind" != "ordinary" ]]; then
+  _pbg_d_load_registry || true
+  if [[ "$_pbg_d_registry_state" != "valid" ]]; then
+    echo "[harness:pre_bash_guard] 阻断（Claude CLI 派遣治理）：当前环境唯一 registry ${_pbg_d_registry} ${_pbg_d_registry_state}；疑似 Claude CLI 子 Agent 派遣按 fail-closed 拒绝，不回退其他环境的表。请修复 registry，子 Agent 请改用平台 Agent 工具。" >&2
+    exit 2
+  fi
+  if [[ "$_pbg_d_kind" == "claude-dispatch" ]]; then
+    echo "[harness:pre_bash_guard] 阻断（Claude CLI 派遣治理）：禁止通过 Bash 直接或浅包壳调用 claude -p/--print 承担子 Agent；请使用平台 Agent 工具。登记组件入口不受此禁令影响。" >&2
+    exit 2
+  fi
+
+  # backend-entry：原始入口不得含 traversal；解析后必须留在本环境 components root，再转统一 canonical 比对。
+  if [[ "$_pbg_d_head" == *'/../'* || "$_pbg_d_head" == '../'* || "$_pbg_d_head" == *'/..' ]]; then
+    echo "[harness:pre_bash_guard] 阻断（Claude CLI 派遣治理）：登记后端入口含 .. 路径穿越。" >&2
+    exit 2
+  fi
+  _pbg_d_entry_real="$(realpath "$_pbg_d_head" 2>/dev/null || true)"
+  _pbg_d_root_real="$(realpath "$_pbg_d_components" 2>/dev/null || true)"
+  if [[ -z "$_pbg_d_entry_real" || -z "$_pbg_d_root_real" || "$_pbg_d_entry_real" != "$_pbg_d_root_real/"* ]]; then
+    echo "[harness:pre_bash_guard] 阻断（Claude CLI 派遣治理）：后端入口 realpath 越出当前环境 components root（拒绝同 basename、绝对越界与 symlink 逃逸）。" >&2
+    exit 2
+  fi
+  _pbg_d_canonical="components/${_pbg_d_entry_real#"$_pbg_d_root_real/"}"
+  case "$_pbg_d_entries" in
+    *"|$_pbg_d_canonical|"*) : ;;
+    *)
+      echo "[harness:pre_bash_guard] 阻断（Claude CLI 派遣治理）：入口 canonical 未登记：$_pbg_d_canonical。" >&2
+      exit 2 ;;
+  esac
 fi
 
 # ---- 旁路：命令前缀形态（Q2 决议 · HITL-3 方案 A 后唯一形态，命中即放行、不输出）----

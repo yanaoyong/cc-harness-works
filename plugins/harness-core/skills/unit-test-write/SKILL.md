@@ -1,5 +1,6 @@
 ---
 name: unit-test-write
+description: 为本次代码改动编写覆盖正常、边界与异常路径的单元测试
 trigger: 阶段5 单元测试编写
 inputs: 阶段4 通过的代码与改动清单
 outputs: 单元测试、单测报告

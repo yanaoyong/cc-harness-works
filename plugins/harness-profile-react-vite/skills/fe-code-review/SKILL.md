@@ -1,5 +1,6 @@
 ---
 name: fe-code-review
+description: 对 React 与 Vite 前端编码产出执行栈特定结构化检查
 trigger: 阶段4 FE 编码评审（React+Vite · 与 expert-reviewer 配合）
 inputs: 阶段3 FE 代码与 coding_report_vN.md
 outputs: 辅助检查项（并入 code_review 报告或 checklist 附页）

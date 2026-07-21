@@ -16,9 +16,11 @@
 #
 # 旗标：
 #   --yes          非交互（B 路径首会话默认授权〔opt-out 逃生阀关闭前 · ADR-015〕；A 路径 command 向用户确认后传入）
-#   --report-only  只探测三项就绪态（engine/index/wiki）并输出，零写入；
-#                  输出固定三行 key=value（engine=ready|missing / index=… / wiki=…），
-#                  全就绪 exit 0、有缺项 exit 20（供 T4 hint hook 机读；优先级高于其他旗标）
+#   --report-only  只读探测 bootstrap 三项就绪态（engine/index/wiki）与分发依赖命令
+#                  （git/python3/ruff/npx），零写入；输出固定 key=value 行：
+#                  engine/index/wiki=ready|missing，command.<name>=available|degraded；
+#                  degraded 表示命令缺失但不阻断不依赖它的核心流程。
+#                  全部 ready/available exit 0、有缺项 exit 20（供 T4 hint hook 机读；优先级高于其他旗标）
 #   --background   自后台化（nohup 重跑自身 --yes），本进程秒退 exit 0（F-3 · B 路径支撑）；
 #                  日志：$STATE_DIR/bootstrap.log（每次后台运行覆写 = 最近一次结果语义；
 #                  STATE_DIR=${HARNESS_STATE_DIR:-$TOP/.harness/state} · 项目本地 · ADR-016）
@@ -54,7 +56,8 @@ usage() {
   cat >&2 <<'USAGE'
 用法：harness_bootstrap.sh [--yes] [--report-only] [--background]
   --yes          非交互模式（跳过引擎安装确认；B 路径首会话默认授权〔opt-out · ADR-015〕/ A 路径用户确认后传入）
-  --report-only  只探测 engine/index/wiki 三项就绪态并输出，零写入（全就绪 0 / 有缺项 20）
+  --report-only  只读探测 engine/index/wiki 与 git/python3/ruff/npx，零写入
+                 （全就绪/可用 0；有缺项 20，degraded 不阻断无依赖核心流程）
   --background   nohup 自后台化，本进程秒退（日志 $STATE_DIR/bootstrap.log）
 退出码：0 全就绪 / 20 部分完成(降级) / 21 校验失败或缺失拒装 / 22 无网络或下载失败 / 2 用法或环境错误
 USAGE
@@ -202,7 +205,7 @@ _locate_rescan() {
 }
 
 # ============================================================
-# --report-only：三项就绪态探测（A-2 检测项对齐 · 零写入 · 最先处理）
+# --report-only：bootstrap 就绪态 + 分发依赖命令探测（零写入 · 最先处理）
 # ============================================================
 
 if [ "$REPORT_ONLY" -eq 1 ]; then
@@ -213,6 +216,16 @@ if [ "$REPORT_ONLY" -eq 1 ]; then
   echo "engine=$eng"
   echo "index=$idx"
   echo "wiki=$wik"
+  for cmd in git python3 ruff npx; do
+    cmd_state="degraded"
+    if command -v "$cmd" >/dev/null 2>&1; then
+      cmd_state="available"
+    else
+      miss=1
+    fi
+    echo "command.$cmd=$cmd_state"
+  done
+  echo "degraded_policy=missing commands do not block core flows that do not depend on them"
   if [ "$miss" -eq 0 ]; then exit 0; else exit 20; fi
 fi
 

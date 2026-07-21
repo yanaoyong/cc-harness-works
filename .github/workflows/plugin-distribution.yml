@@ -1,0 +1,44 @@
+name: Plugin distribution integrity
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      release_commit:
+        description: Optional commit/ref for local release-tag validation
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  distribution:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Claude Code validator
+        run: npm install --global @anthropic-ai/claude-code
+      - name: Run ordinary distribution checks
+        if: ${{ inputs.release_commit == '' }}
+        run: python3 .harness/scripts/check_plugin_distribution.py
+      - name: Run explicit release-context checks
+        if: ${{ inputs.release_commit != '' }}
+        # Workflow input is data, not shell source: pass through env and quote the argv value.
+        env:
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
+        run: >-
+          python3 .harness/scripts/check_plugin_distribution.py
+          --tag-repo .
+          --release-commit "$RELEASE_COMMIT"

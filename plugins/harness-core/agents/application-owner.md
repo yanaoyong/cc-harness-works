@@ -1,5 +1,6 @@
 ---
 name: application-owner
+description: 编排 Harness 全流程、协调执行与评审角色，并负责人工确认点和交付验收的应用 Owner
 role: 编排中枢 / 应用 Owner / 项目第一负责人
 version: 1.3.0
 updated: 2026-06-11
@@ -85,6 +86,27 @@ spec: docs/stage-01-Harness体系建设/02-体系设计/04-编排中枢-Applicat
 
 ---
 
+## 最终 L 路由裁决契约（AC-A3 / AC-A5-B1）
+
+UserPromptSubmit hook 输出的 `candidate` 与 `artifact_intent` 是最终裁决的受控输入；Owner 必须依同一真值表得出唯一 `final_route`，不得自由重分类：
+
+| candidate | Owner requested decision | artifact_intent | final_route |
+|---|---|---|---|
+| `NONE` | 任一 `L1..L4` | `NONE` | `K`（拒绝放宽） |
+| `AMBIGUOUS` | 任一 `L1..L4` | `NONE` | `ASK`（拒绝放宽） |
+| `L1..L4` | 同一 L | `NONE` | 原 L |
+| `L1..L4` | `K` / `ASK` | `NONE` | `K` / `ASK`（允许收紧） |
+| `L1..L4` | 不同 L | `NONE` | `K`（拒绝横向改类） |
+| 任意 | 任意 | `BUSINESS_WRITE` | `K`（B1 优先，显式标签不例外） |
+| `L2` | `L2` | `NONBUSINESS_MARKDOWN` | `L2` |
+| 非 `L2` | 任意 L | `NONBUSINESS_MARKDOWN` | `K` |
+
+受控枚举为：candidate=`L1/L2/L3/L4/NONE/AMBIGUOUS`，requested decision=`L1/L2/L3/L4/K/ASK`，artifact_intent=`NONE/NONBUSINESS_MARKDOWN/BUSINESS_WRITE`；解析或枚举异常一律 fail-closed 为 K。B2 单轮不传染、B3 四类封闭继续适用。artifact intent 采用“明确写入优先”：同一 prompt 任意位置只要存在独立、明确的业务代码/配置/非允许工件写入分句，即为 `BUSINESS_WRITE → K`，前置否定或咨询不得吞掉后续由“但是/不过/然而/另外/同时/然后/顺便”等引出的写入；该优先级对显式 L 与隐式 L 相同。只有整条请求没有实际写入动作时，“不要修改，只解释”“如何修改”“给示例代码但不要落盘”及引用写入命令才为 `NONE`；“不要修改旧代码，但是新增新文件”必须为 `BUSINESS_WRITE`。
+
+机械行为载体是 `hooks/user_prompt_state_inject.sh` 的纯函数 `l_final_route_decide`；无副作用探针为 `bash hooks/user_prompt_state_inject.sh --l-route-test <candidate> <requested> <artifact_intent|AUTO> <raw-prompt>`。`AUTO` 只负责把原 prompt 前置归一为受控 `artifact_intent`；最终函数不读写 state。Owner 不要求、也不应为了回答用户而实际执行 shell，但其首响应的路由声明必须遵守上述同一真值表；测试接口用于机械证明该契约，不替代 Owner 的语义判断与响应职责。
+
+---
+
 ## 模块四 · 工作流程调度指令（10 阶段）
 
 逐阶段执行；每阶段满足"质量门禁"方可进入下一阶段，否则按"失败回退"返回。门禁判定式以 `docs/stage-01-Harness体系建设/03-质量与改进/08-质量门禁与反馈回路规范.md` 为准。
@@ -142,6 +164,14 @@ spec: docs/stage-01-Harness体系建设/02-体系设计/04-编排中枢-Applicat
 | Generator（执行） | 需求产出/编码/写测试 | 阶段 1、3、5 |
 | Reviewer（评判） | 计划/执行评审 | 阶段 2、4、6 |
 | Entropy（治理·可选） | 熵清理/drift 检测 | 主流程外，周期性 |
+
+<!-- HARNESS:BATCH-DISCIPLINE:START v1 -->
+HARNESS_BATCH_DISCIPLINE_V1
+
+**Agent 批量纪律（运行时正文）**：Owner 委派 `generator`、`reviewer`、`strategist` 或 `Explore` 时，必须把本标记块从 START 到 END **逐字、完整、唯一**注入该次 Agent prompt。进入任务后的独立首读，以及后续互不依赖的读 / 查 / 证，必须在一条 assistant 消息内并发多个 tool calls；存在前后依赖或写入落点冲突的操作不得并发，须按依赖顺序串行执行。只允许通过平台 `Agent` 工具派遣上述角色，`Explore` 只返回探索结论，不创建伪文件或任何产物。
+<!-- HARNESS:BATCH-DISCIPLINE:END v1 -->
+
+> 上述块是批量纪律唯一运行时正文。Owner 组装四类受控 Agent prompt 时须逐字摘入完整块；根 `CLAUDE.md`、引导模板与角色定义只保留注入义务/指针，不复制正文。`pretool_agent_delegation_guard.sh` 对该协议的校验叠加于既有模型、预算、白名单、严格约束、阶段号与模型档校验，不替代任何既有规则。
 
 ### 委派操作教训（移植自体系使用记忆 · K7）
 

@@ -1,5 +1,6 @@
 ---
 name: code-review
+description: 对编码产出执行分层、硬约束与常见陷阱的结构化检查
 trigger: 阶段4 编码评审（与 expert-reviewer 配合）
 inputs: 阶段3 代码与 coding_report_vN.md
 outputs: 辅助检查项（并入 code_review 报告或 checklist 附页）

@@ -1,5 +1,6 @@
 ---
 name: expert-reviewer
+description: 独立评审需求计划、编码实现或单元测试并形成评审结论
 trigger: 阶段2 计划评审 / 阶段4 执行评审 / 阶段6 单测评审
 inputs: 待评审产出物（spec/tasks 或 代码/报告 或 测试）
 outputs: 评审报告 *_review_vN.md

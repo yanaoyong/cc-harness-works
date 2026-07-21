@@ -1,5 +1,6 @@
 ---
 name: setup
+description: 在 SessionStart hook 不可用时手动注入完整常驻调度契约
 trigger: 用户显式调用 `/setup`（hook 被禁用时的降级回退）
 inputs: 无
 outputs: 常驻契约注入内容展示 + 脚手架位置提示

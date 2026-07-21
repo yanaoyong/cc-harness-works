@@ -7,8 +7,10 @@
 #
 # 契约：
 #   * 注册：PreToolUse + matcher="Agent|Task"（本环境委派工具名 = Agent；历史版本 = Task，双兼容）。
-#   * 仅对 subagent_type 尾段 ∈ {generator, reviewer, strategist} 生效（含 plugin 前缀如 harness-core:generator）；
-#     其余 subagent_type（general-purpose/Explore/Plan/claude…）直接 exit 0 放行（AC-7）。
+#   * 批量纪律 v1 叠加协议受控角色 = {generator, reviewer, strategist, Explore}。默认策略常量
+#     HARNESS_BATCH_DISCIPLINE_POLICY_V1_DEFAULT=compat-v1：完全无 v1 痕迹仅 warning 后继续原校验；
+#     任一痕迹出现即要求精确唯一、配对、含 sentinel 且正文非空，否则 fail-closed。下一发布只把默认值
+#     改为 strict-v1，即对完全缺块也 deny；禁止日期判断。Explore 只受本协议，不套三角色既有要素。
 #   * 四要素（AC-5）：a) tool_input.model 在场；b) prompt 含回合预算字样（「回合预算」/「≤N 回合」）；
 #     c) prompt 含产物路径白名单字样（「白名单」/「产物路径」）；d) reviewer/strategist 时 prompt 含「严格约束」。
 #   * 第五要素（T-4 · AC-4.1 · 仅 generator/reviewer）：e) prompt 含「阶段 N」字样（阶段[[:space:]]*[0-9]+）；
@@ -68,16 +70,52 @@ command -v jq >/dev/null 2>&1 || exit 0
 subagent_type="$(jq -r '.tool_input.subagent_type // empty' <<<"$payload" 2>/dev/null || true)"
 [ -n "$subagent_type" ] || exit 0   # 非委派或解析不出类型 → 放行
 
-# 尾段匹配（剥离 plugin 前缀，如 harness-core:generator → generator）
 role="${subagent_type##*:}"
 case "$role" in
-  generator|reviewer|strategist) ;;
-  *) exit 0 ;;   # AC-7：非受控 subagent_type 直接放行
+  generator|reviewer|strategist|Explore) ;;
+  *) exit 0 ;;   # 非受控 subagent_type 不受 v1 强制，原行为保持
 esac
 
 prompt="$(jq -r '.tool_input.prompt // empty' <<<"$payload" 2>/dev/null || true)"
 model="$(jq -r '.tool_input.model // empty' <<<"$payload" 2>/dev/null || true)"
 session_id="$(jq -r '.session_id // empty' <<<"$payload" 2>/dev/null || true)"
+
+# ---- Agent 批量纪律 v1（叠加协议；不替代后续既有校验）----
+HARNESS_BATCH_DISCIPLINE_POLICY_V1_DEFAULT="compat-v1"
+batch_policy="${HARNESS_BATCH_DISCIPLINE_POLICY_V1:-$HARNESS_BATCH_DISCIPLINE_POLICY_V1_DEFAULT}"
+batch_start='<!-- HARNESS:BATCH-DISCIPLINE:START v1 -->'
+batch_end='<!-- HARNESS:BATCH-DISCIPLINE:END v1 -->'
+batch_sentinel='HARNESS_BATCH_DISCIPLINE_V1'
+start_count="$(printf '%s' "$prompt" | grep -Foc "$batch_start" 2>/dev/null || true)"
+end_count="$(printf '%s' "$prompt" | grep -Foc "$batch_end" 2>/dev/null || true)"
+sentinel_count="$(printf '%s' "$prompt" | grep -Foc "$batch_sentinel" 2>/dev/null || true)"
+trace_count="$(printf '%s' "$prompt" | grep -Ec 'HARNESS:BATCH-DISCIPLINE:|HARNESS_BATCH_DISCIPLINE' 2>/dev/null || true)"
+batch_ok=0
+if [ "$trace_count" = "0" ]; then
+  if [ "$batch_policy" = "strict-v1" ]; then
+    printf '[harness:agent_delegation_guard] 阻断：委派 %s 缺少 Agent 批量纪律 v1 完整块（policy=%s）。\n' "$role" "$batch_policy" >&2
+    exit 2
+  fi
+  printf '[harness:agent_delegation_guard] warning：委派 %s 使用纯旧版 prompt，尚无批量纪律 v1 痕迹；兼容期继续既有校验（policy=%s）。\n' "$role" "$batch_policy" >&2
+else
+  batch_body=""
+  if [ "$start_count" = "1" ] && [ "$end_count" = "1" ] && [ "$sentinel_count" = "1" ] && [ "$trace_count" = "3" ]; then
+    batch_after_start="${prompt#*"$batch_start"}"
+    # 起止逆序时 ${batch_after_start%%END*} 仍不含 END，显式检查截断。
+    case "$batch_after_start" in
+      *"$batch_end"*) batch_body="${batch_after_start%%"$batch_end"*}" ;;
+    esac
+    batch_content="$(printf '%s' "$batch_body" | sed "s/$batch_sentinel//" | tr -d '[:space:]')"
+    [ -n "$batch_content" ] && batch_ok=1
+  fi
+  if [ "$batch_ok" != "1" ]; then
+    printf '[harness:agent_delegation_guard] 阻断：委派 %s 的批量纪律 v1 损坏（须精确唯一 START/END、唯一 sentinel、配对且正文非空；禁止新旧标记混装）。\n' "$role" >&2
+    exit 2
+  fi
+fi
+
+# Explore 只叠加 v1 协议；不伪造 generator/reviewer/strategist 的模型、预算、白名单等既有契约。
+[ "$role" = "Explore" ] && exit 0
 
 # 阶段号解析（复用既有正则 · 供第五要素校验 / 对表校验 / 台账三处共用 · T-4）
 # chore-hook-governance-hardening-20260715 · T-4：由原放行块内解析上移，净零子进程增量。
