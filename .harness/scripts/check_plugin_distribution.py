@@ -169,6 +169,10 @@ def parse_manifest(root: Path, manifest_path: Path) -> tuple[dict[str, Any], lis
         for item in parsed
         if item["type"] in {"file", "directory"}
     }
+    # Release-chain entry points that must stay manifest-listed.  Dropping one
+    # used to pass source-repo checks silently because the file still exists in
+    # the work tree — that blind spot shipped the sync script unlisted and was
+    # only caught by the public-side checker after release (hotfix #293).
     required_sources = {
         MARKETPLACE_MANIFEST,
         DEFAULT_DISTRIBUTION_MANIFEST,
@@ -176,6 +180,7 @@ def parse_manifest(root: Path, manifest_path: Path) -> tuple[dict[str, Any], lis
         WORKFLOW_PATH,
         LICENSE_PATH,
         GUIDE_PATH,
+        SYNC_SCRIPT_PATH,
     }
     for index, plugin in enumerate(plugins):
         if not isinstance(plugin, dict):

@@ -6,10 +6,10 @@
 #   bash .harness/scripts/list_changes.sh --write          # 默认 --all + 刷新 INDEX.md
 #   bash .harness/scripts/list_changes.sh --active --write # 过滤器与 --write 可组合
 # 字段来源: 各 summary.md 头部（需求名称 / 中文描述 / 原始请求 / 总体状态 / 当前阶段）。
-# 归类与 .claude/hooks/user_prompt_state_inject.sh L82–L106 对齐:
-#   1. strip 状态值的 ** 修饰字符（hook L82: s/\*//g）
+# 归类逻辑见 .harness/scripts/list_flows.sh classify_bucket() 与本文件 classify()（两者口径一致）:
+#   1. strip 状态值的 ** 修饰字符（本文件 PARSE_AWK END 段剥 * 处理）
 #   2. {{占位}} / A_R1_CODE_ONLY* → 异常豁免档
-#   3. PASSED + stage=10 → 闭合档（精确字串比较）
+#   3. PASSED + stage 以 10 起始 → 闭合档（前缀匹配 · 容忍「10（…）」等后缀 · R-8 归类放宽）
 #   4. 其余 → 活跃档
 set -euo pipefail
 
@@ -84,7 +84,12 @@ classify() {
     A_R1_CODE_ONLY*|*CODE_ONLY*) echo exempt; return ;;
     ABANDONED) echo exempt; return ;;  # 遗弃卡归异常/模板档（与 list_flows.sh classify_bucket 对齐）
   esac
-  if [ "$state" = "PASSED" ] && [ "$stage" = "10" ]; then echo closed; return; fi
+  # R-8 归类放宽：stage 以 "10" 起始（允许任意后缀）→ closed；其余 PASSED 形态仍 active
+  if [ "$state" = "PASSED" ]; then
+    case "$stage" in
+      10*) echo closed; return ;;
+    esac
+  fi
   echo active
 }
 
@@ -163,7 +168,7 @@ if [ "$write_index" = "1" ]; then
     echo
     echo "> **自动生成 · 禁止手改**。由 \`bash .harness/scripts/list_changes.sh --write\` 刷新；手动修改本文件会在下次 \`--write\` 时被覆盖。"
     echo "> 数据源：各 \`.harness/changes/<dir>/summary.md\` 头部表（需求名称 / 中文描述 / 原始请求 / 总体状态 / 当前阶段）。"
-    echo "> 归类逻辑与 \`.claude/hooks/user_prompt_state_inject.sh\` L82–L106 对齐。"
+    echo "> 归类逻辑见 \`.harness/scripts/list_flows.sh classify_bucket()\` 与 \`.harness/scripts/list_changes.sh classify()\`（本脚本）。"
     echo "> 生成时间：$ts · 过滤器：\`$filter\`"
     echo
     echo "## 汇总"

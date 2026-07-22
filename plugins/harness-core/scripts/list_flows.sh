@@ -6,7 +6,7 @@
 #   bash .harness/scripts/list_flows.sh [--all|--active|--closed|--exempt] [--format=plain|json|brief] [--write]
 #     --all              全部流程实例（默认）
 #     --active           仅 IN_PROGRESS / REOPENED
-#     --closed           仅闭合：state==PASSED 且无 REOPENED/BLOCKED 子项；10 阶段还需 stage==10，元流程需 M5 PASSED
+#     --closed           仅闭合：state==PASSED 且无 REOPENED/BLOCKED 子项；10 阶段还需 stage 以 10 起始，元流程需 M5 起始 PASSED
 #     --exempt           异常/模板：_* 模板目录 / ABANDONED / {{占位}} / *CODE_ONLY* 异常豁免
 #     --format=plain     文本分组表（默认 · 用户读）
 #     --format=brief     精简聚合行（hook 注入用 · --active 空集时 stdout 为空）
@@ -183,10 +183,11 @@ classify_bucket() {
   esac
   if [ "$state" = "PASSED" ]; then
     if [ "$open_sub" = "1" ]; then echo other; return; fi
+    # R-8 归类放宽：stage 以 M5 / 10 起始（允许任意后缀）→ closed；组归属判定不变
     if [ "$group" = "meta" ]; then
-      [ "$stage" = "M5" ] && { echo closed; return; }
+      case "$stage" in M5*) echo closed; return ;; esac
     else
-      [ "$stage" = "10" ] && { echo closed; return; }
+      case "$stage" in 10*) echo closed; return ;; esac
     fi
     echo other; return
   fi

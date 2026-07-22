@@ -23,6 +23,12 @@
 #   AC-14 sync 后在 **target 公有仓工作副本内**（非本仓）diff README.md 与其 git HEAD 版本；检出 heredoc
 #         覆盖回退 → 在 target 仓内 `git checkout -- README.md` 恢复手工版（前提：手工 README 已 commit），
 #         或即停提示人工——**不静默丢失**手工 README、不 push。前置校验 target 须为 git 仓且 README 已入库。
+#   AC-V3 sync 完成后、AC-14 README 回退检出**之前**，对 target 工作副本跑 check_plugin_distribution.py
+#         （--target parity · --skip-official-validator · offline 只读零出站）——阶段9 验证面覆盖
+#         "仅按 manifest 同步后的文件集"（变更 chore-verify-guard-hardening-20260722 · R-3 根因②）。
+#         插序约束：AC-14 恢复手工 README 后 target README ≠ generated 条目内容，checker 会误报
+#         generated content mismatch，故校验必须先于 README checkout；失败即非 0 退出（exit 5），
+#         不进入 README 回退与 tag 清单。
 #   AC-15 push / tag 推送默认**只做核对与清单准备**，绝不默认执行；出仓动作留 DF-007 授权门后由人工执行。
 #         本脚本全文不含默认 `git push` / `git push --tags` 动作（文本审查可证）。
 #   AC-16 生成 tag 清单（版本 tag 名 + 待推 remote + 待人工执行的命令），脚本不默认 `git push --tags`。
@@ -54,6 +60,7 @@
 #   2 lockstep 版本一致性断言失败（AC-12 / AC-22 · 报出已改/未改清单）
 #   3 sync 前置校验失败（target 非 git 仓 / README 未入库 · AC-14 前置）或 README 回退处置需人工
 #   4 sync 委派脚本执行失败
+#   5 AC-V3 target checker 验证环节失败（checker 脚本缺失或校验失败 · stderr 含 checker 输出）
 set -uo pipefail
 
 SCRIPT_NAME="stage9_release.sh"
@@ -203,7 +210,8 @@ print_sync_plan() {
     log "sync 计划：--skip-sync 已指定 → 跳过公有仓 sync 环节。"
   else
     log "sync 计划：委派 .harness/scripts/sync_public_marketplace.sh \"$public_repo\""
-    log "           sync 后在 target 仓内 diff README.md vs git HEAD → 检出 heredoc 回退即 checkout 恢复手工版（AC-14）。"
+    log "           sync 后、README 回退检出前对 target 跑 checker parity（AC-V3 · offline 只读零出站），"
+    log "           然后在 target 仓内 diff README.md vs git HEAD → 检出 heredoc 回退即 checkout 恢复手工版（AC-14）。"
   fi
 }
 print_tag_plan() {
@@ -319,6 +327,21 @@ else
   if ! bash "$sync_script" "$public_repo"; then
     die 4 "sync 委派脚本执行失败（详见其输出）。已 bump 的 lockstep 保留，未 push。请人工排查。"
   fi
+
+  # AC-V3（变更 chore-verify-guard-hardening-20260722 · R-3 根因②）：sync 完成后、AC-14 README
+  # 回退检出**之前**，对 target 工作副本跑 checker parity——阶段9 验证面覆盖"仅按 manifest 同步后
+  # 的文件集"。插序约束：AC-14 恢复手工 README 后 target README ≠ generated 条目内容，checker 会
+  # 误报 generated content mismatch，故校验必须先于 README checkout（target 模式取证：.git/ 已被
+  # checker 豁免、手工 README 靠插序规避，无需 checker 适配）。offline · 只读 · 零出站：
+  # --skip-official-validator（不跑外部官方 validator）；不 push、不写公有仓 git。
+  checker_script="$repo_root/.harness/scripts/check_plugin_distribution.py"
+  [ -f "$checker_script" ] || die 5 "checker 脚本缺失：$checker_script（AC-V3 验证环节无法执行 · 即停不臆测）"
+  log "AC-V3：对 target 跑 checker parity（offline · 验证\"仅按 manifest 同步后的文件集\"）..."
+  if ! python3 "$checker_script" --repo-root "$repo_root" --target "$public_repo" --skip-official-validator; then
+    die 5 "target checker 验证失败（上方 ERROR 输出来自 check_plugin_distribution.py，即失败点）。
+  → stage9 即停：不进入 README 回退与 tag 清单，未 push。请人工排查 manifest 漏列 / 同步不完整后重跑（AC-V3）。"
+  fi
+  log "AC-V3：target checker 通过（源仓自查 + target parity 全绿）。"
 
   # AC-14：sync 后在 target 仓内 diff README.md vs 其 git HEAD → 检出 heredoc 回退即 checkout 恢复手工版
   if git -C "$public_repo" diff --quiet -- README.md 2>/dev/null; then

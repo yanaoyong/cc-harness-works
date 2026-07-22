@@ -37,7 +37,7 @@ fi
 #      防拼出假路径 · 承 failure-record-001）
 #   ④ 全不命中 → 既有内联兜底（resolve_root / _eval_status 内联版 · AC-1.4 优雅降级不崩）
 # $TOP 先于 lib 探测以内联三层 fallback（git → CLAUDE_PROJECT_DIR → PWD）推得；
-# _HOOK_DIR 取物理路径（pwd -P · 禁 realpath），兼作 G-1 双注入守卫的自身位置判据。
+# _HOOK_DIR 取物理路径（pwd -P · 避免依赖额外路径工具），兼作 G-1 双注入守卫的自身位置判据。
 _HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P || true)"
 
 _hook_resolve_top() {
@@ -590,7 +590,7 @@ _g1_should_yield() {
   # $TOP/.claude/settings.json 或 settings.local.json 任一文件已含 user_prompt_state_inject
   # 注册字样 → 返回 0（项目注册为准 · 调用方静默 exit 0）。
   # grep 失败 / 两文件均缺失 / 路径推导失败 → 返回 1（fail-open 正常注入）。
-  # 物理路径经 pwd -P 推得（禁 realpath · macOS/bash 3.2 无该命令）；
+  # 物理路径经 pwd -P 推得（兼容 macOS/bash 3.2）；
   # 仅主流程执行路径调用，source 模式（单测）不受影响。
   local top="$1" top_phys f
   [ -n "$_HOOK_DIR" ] || return 1
@@ -653,6 +653,153 @@ append_user_prompt_ledger() {
   [ -f "$sdir/.gitignore" ] || printf '*\n' > "$sdir/.gitignore" 2>/dev/null || true
   f="$sdir/user_prompts_${sid}.log"
   printf '%s\t%s\n' "$ts" "$fullprompt" >> "$f" 2>/dev/null || return 0
+}
+
+# ---------- 单卡创建授权捕获（CCA · card-create 独立 gate）----------
+# 仅 UserPromptSubmit 的真实用户输入可生成 pending；系统通知已由 append_user_prompt_ledger
+# 同口径过滤。外部文本只作为 Python 数据处理，不进入 shell 求值面（SEC-1）。
+# 台账由 PreToolUse guard 在同一锁下执行 pending -> consumed；捕获端只追加 pending。
+capture_card_create_authorization() {
+  # $1=stdin_raw $2=state_dir $3=sid $4=repo_root
+  local raw="$1" sdir="$2" sid="$3" repo_root="$4"
+  [ -n "$raw" ] && [ -n "$repo_root" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  mkdir -p "$sdir" 2>/dev/null || return 0
+  [ -f "$sdir/.gitignore" ] || printf '*\n' > "$sdir/.gitignore" 2>/dev/null || true
+  CCA_PAYLOAD="$raw" python3 - "$sdir" "$sid" "$repo_root" <<'PY' 2>/dev/null || true
+import fcntl, hashlib, json, os, re, subprocess, sys, time
+from pathlib import Path
+
+state_dir, sid, root_arg = sys.argv[1:4]
+payload = json.loads(os.environ.get("CCA_PAYLOAD", "{}"))
+prompt = payload.get("user_prompt") or payload.get("prompt") or ""
+if not isinstance(prompt, str) or not prompt.strip():
+    raise SystemExit
+trimmed = prompt.lstrip()
+if trimmed.startswith(("<task-notification>", "[SYSTEM NOTIFICATION", "<local-command-stdout>",
+                       "<command-name>", "<local-command-caveat>")):
+    raise SystemExit
+
+card_re = re.compile(r"(?<![A-Za-z0-9_./-])([a-z][a-z0-9]*(?:-[a-z0-9]+)+-[0-9]{8})(?![A-Za-z0-9_./-])")
+cards = sorted(set(card_re.findall(prompt)))
+
+def affirmative(text):
+    return bool(re.search(r"(?:授权|批准|同意|确认|请(?:帮我)?(?:创建|开)|帮我开|approve|authori[sz]e|create\s+(?:the\s+)?card|open\s+(?:the\s+)?card)", text, re.I))
+
+def creation_bound(text):
+    return bool(re.search(r"(?:开卡|创建(?:这张|该|此)?(?:变更)?卡|create\s+(?:the\s+)?card|open\s+(?:the\s+)?card|card-create)", text, re.I))
+
+source = "direct-user"
+authorized = len(cards) == 1 and affirmative(prompt) and creation_bound(prompt)
+# AskUserQuestion 的回答可很短，但只有最近 assistant 问题本身唯一点名完整卡名并明确询问开卡授权时才成立。
+if not authorized and affirmative(prompt) and not cards:
+    transcript = payload.get("transcript_path")
+    question = ""
+    if isinstance(transcript, str) and transcript:
+        try:
+            with open(transcript, "rb") as fh:
+                lines = fh.readlines()[-80:]
+            for raw_line in reversed(lines):
+                try:
+                    obj = json.loads(raw_line)
+                except Exception:
+                    continue
+                msg = obj.get("message", obj)
+                if msg.get("role") != "assistant":
+                    continue
+                content = msg.get("content", [])
+                if not isinstance(content, list):
+                    continue
+                for item in reversed(content):
+                    if not isinstance(item, dict) or item.get("type") != "tool_use":
+                        continue
+                    if item.get("name") not in ("AskUserQuestion", "ask_user_question"):
+                        continue
+                    inp = item.get("input", {})
+                    qs = inp.get("questions", []) if isinstance(inp, dict) else []
+                    question = " ".join(str(q.get("question", "")) for q in qs if isinstance(q, dict))
+                    break
+                if question:
+                    break
+        except OSError:
+            pass
+    qcards = sorted(set(card_re.findall(question)))
+    if len(qcards) == 1 and creation_bound(question) and re.search(r"(?:授权|批准|同意|确认|approve|authori[sz]e)", question, re.I):
+        cards, authorized, source = qcards, True, "ask-user-question"
+if not authorized or len(cards) != 1:
+    raise SystemExit
+card = cards[0]
+if card == "_TEMPLATE" or not re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)+-[0-9]{8}", card):
+    raise SystemExit
+
+def git(*args):
+    return subprocess.check_output(["git", "-C", root_arg, *args], text=True, stderr=subprocess.DEVNULL).strip()
+try:
+    root = str(Path(git("rev-parse", "--show-toplevel")).resolve(strict=False))
+    common = str((Path(root_arg) / git("rev-parse", "--git-common-dir")).resolve(strict=False))
+    gitdir = str((Path(root_arg) / git("rev-parse", "--git-dir")).resolve(strict=False))
+except Exception:
+    raise SystemExit
+if root != str(Path(root_arg).resolve(strict=False)):
+    raise SystemExit
+
+def normalize_remote(url):
+    url = url.strip()
+    m = re.match(r"git@([^:]+):(.+)$", url)
+    if m:
+        url = "ssh://git@" + m.group(1) + "/" + m.group(2)
+    url = re.sub(r"^[a-z]+://(?:[^/@]+@)?", "", url, flags=re.I)
+    url = url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    return re.sub(r"\.git$", "", url, flags=re.I).lower()
+try:
+    remotes = git("remote").splitlines()
+    if "origin" in remotes:
+        remote = normalize_remote(git("remote", "get-url", "origin"))
+    else:
+        vals = sorted(set(normalize_remote(git("remote", "get-url", r)) for r in remotes))
+        if len(vals) != 1:
+            raise ValueError
+        remote = vals[0]
+except Exception:
+    raise SystemExit
+if not remote:
+    raise SystemExit
+project_id = f"root={root}|common={common}|remote={remote}"
+card_id = f"{project_id}::{card}"
+changes = os.path.join(root, ".harness", "changes")
+target = os.path.join(changes, card)
+# 已存在目标不是“首次创建”；不得留下可在未来删除后复用的悬空授权。
+if os.path.lexists(target):
+    raise SystemExit
+os.makedirs(state_dir, mode=0o700, exist_ok=True)
+ledger = os.path.join(state_dir, "card_create_authorizations.jsonl")
+lock_path = os.path.join(state_dir, "card_create_authorizations.lock")
+event = str(payload.get("prompt_id") or "")
+record = {
+    "type": "pending", "gate": "card-create", "created_ns": time.time_ns(),
+    "session_id": sid, "canonical_project_id": project_id, "worktree_id": gitdir,
+    "canonical_card_id": card_id, "card": card, "source": source,
+    "event_id": event,
+}
+record["authorization_id"] = hashlib.sha256(
+    f"{sid}\0{card_id}\0{record['created_ns']}\0{event}".encode()
+).hexdigest()
+with open(lock_path, "a+", encoding="utf-8") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    if event and os.path.isfile(ledger):
+        with open(ledger, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    old = json.loads(line)
+                except Exception:
+                    continue
+                if old.get("type") == "pending" and old.get("event_id") == event and old.get("session_id") == sid:
+                    raise SystemExit
+    with open(ledger, "a", encoding="utf-8") as out:
+        out.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        out.flush()
+        os.fsync(out.fileno())
+PY
 }
 
 # ---------- 上下文水位（T-A1 · feat-segmentation-and-statedir-fix-20260714）----------
@@ -921,6 +1068,7 @@ main() {
   # T1 用户授权台账落盘（feat-hitl-authz-hardening · AC-1）——置于 g1 让位之后、仅主注入副本落盘，
   # 避免双活场景 append-only 审计文件双写（与常驻契约哨兵同口径）。fail-open 恒不影响注入。
   append_user_prompt_ledger "$stdin_raw" "$_state_dir" "$_sid" || true
+  capture_card_create_authorization "$stdin_raw" "$_state_dir" "$_sid" "$root" || true
 
   # 上下文水位（T-A1）：transcript_path 自 UserPromptSubmit stdin payload 取（官方 hook 公共字段）；
   # 水位 = 最后 assistant usage(cache_read+cache_creation)。fail-open：任一环节缺 → _water 留空、水位行静默跳过。

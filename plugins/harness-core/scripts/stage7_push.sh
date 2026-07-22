@@ -69,6 +69,116 @@ log()  { printf '[%s] %s\n' "$SCRIPT_NAME" "$*"; }
 warn() { printf '[%s] ⚠ %s\n' "$SCRIPT_NAME" "$*" >&2; }
 die()  { local code="$1"; shift; printf '[%s] ✗ %s\n' "$SCRIPT_NAME" "$*" >&2; exit "$code"; }
 
+# Persist only the stable PR identity in the stage-7 output cell. Head/SHA remain runtime evidence.
+record_spi() {
+  local url="$1" summary="$card_dir/summary.md" remote_url parsed repo_id pr_number canonical current_head pr_head
+  [ -f "$summary" ] || die 5 "PR 已存在但 summary.md 不存在：$summary"
+  remote_url="$(git remote get-url "$remote" 2>/dev/null || true)"
+  parsed="$(python3 - "$remote_url" "$url" <<'PY_PARSE'
+import re
+import sys
+from urllib.parse import urlsplit
+
+remote_url, pr_url = sys.argv[1:]
+
+
+def github_segment(value):
+    # GitHub owner/repository literal segments: ASCII alnum plus common '.', '-', '_'.
+    # Reject percent encoding, URL structural metacharacters, and dot-only path segments.
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", value) or not value.strip("."):
+        raise ValueError
+    return value
+
+
+def remote_identity(value):
+    match = re.fullmatch(r"git@github[.]com:([^/]+)/([^/]+)", value)
+    if match:
+        owner, repo = match.groups()
+    else:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"ssh", "https"}
+            or parsed.hostname is None
+            or parsed.hostname.casefold() != "github.com"
+            or parsed.port is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError
+        if parsed.scheme == "ssh":
+            if parsed.username != "git" or parsed.password is not None:
+                raise ValueError
+        elif parsed.username is not None or parsed.password is not None:
+            raise ValueError
+        parts = parsed.path.split("/")
+        if len(parts) != 3 or parts[0] or not parts[1] or not parts[2]:
+            raise ValueError
+        owner, repo = parts[1:]
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    return github_segment(owner), github_segment(repo)
+
+try:
+    owner, repo = remote_identity(remote_url)
+except (ValueError, TypeError):
+    raise SystemExit("invalid GitHub remote")
+
+match = re.fullmatch(
+    r"https://github[.]com/([^/]+)/([^/]+)/pull/([0-9]+)", pr_url
+)
+if not match:
+    raise SystemExit("invalid canonical PR URL")
+pr_owner, pr_repo, number = match.groups()
+try:
+    pr_owner = github_segment(pr_owner)
+    pr_repo = github_segment(pr_repo)
+except ValueError:
+    raise SystemExit("invalid canonical PR URL")
+if (pr_owner.casefold(), pr_repo.casefold()) != (owner.casefold(), repo.casefold()):
+    raise SystemExit("cross-repository PR URL")
+if not re.fullmatch(r"[1-9][0-9]*", number):
+    raise SystemExit("invalid canonical PR number")
+canonical = f"https://github.com/{owner}/{repo}/pull/{number}"
+print(owner + "/" + repo)
+print(number)
+print(canonical)
+PY_PARSE
+)" || die 5 "PR URL 或 $remote GitHub 仓库身份非法/不匹配：$url"
+  mapfile -t parsed_fields <<<"$parsed"
+  [ "${#parsed_fields[@]}" -eq 3 ] || die 5 "无法解析 canonical GitHub PR 身份：$url"
+  repo_id="${parsed_fields[0]}"
+  pr_number="${parsed_fields[1]}"
+  canonical="${parsed_fields[2]}"
+  [ -n "$repo_id" ] && [ -n "$pr_number" ] && [ -n "$canonical" ] \
+    || die 5 "无法解析 canonical GitHub PR 身份：$url"
+  current_head="$(git rev-parse HEAD 2>/dev/null || true)"
+  pr_head="$(timeout 15 gh pr view "$pr_number" --repo "$repo_id" --json headRefOid --jq .headRefOid 2>/dev/null || true)"
+  [ -n "$current_head" ] && [ "$pr_head" = "$current_head" ] || die 5 "PR head 与本地 HEAD 不一致，停止写 SPI（local=$current_head remote=${pr_head:-unavailable}）"
+  python3 - "$summary" "$pr_number" "$canonical" <<'PY'
+import re,sys
+path,n,url=sys.argv[1:]
+with open(path,encoding="utf-8") as f: lines=f.readlines()
+hits=[]
+for i,line in enumerate(lines):
+    if re.match(r"^\|\s*7\s+代码推送\s*\|",line): hits.append(i)
+if len(hits)!=1: raise SystemExit("stage-7 row missing or ambiguous")
+i=hits[0]
+cells=lines[i].rstrip("\n").split("|")
+if len(cells)<4: raise SystemExit("malformed stage-7 row")
+cells[-2]=f" PR #{n} · {url} "
+lines[i]="|".join(cells)+"\n"
+with open(path,"w",encoding="utf-8",newline="") as f: f.writelines(lines)
+PY
+  if ! git diff --quiet -- "$summary"; then
+    git add -- ":(literal,top)${summary#"$repo_root"/}" || die 5 "SPI 写入后 git add 失败：$summary"
+    git commit -m "chore(harness): record stable PR identity" || die 5 "SPI 写入后 commit 失败"
+    git push "$remote" "$branch" || die 5 "SPI commit push 失败；停止，禁止使用旧 PR head 证据"
+  fi
+  current_head="$(git rev-parse HEAD 2>/dev/null || true)"
+  pr_head="$(timeout 15 gh pr view "$pr_number" --repo "$repo_id" --json headRefOid --jq .headRefOid 2>/dev/null || true)"
+  [ -n "$current_head" ] && [ "$pr_head" = "$current_head" ] || die 5 "SPI push 后 PR head 与本地 HEAD 不一致（local=$current_head remote=${pr_head:-unavailable}）"
+}
+
 # ---------- 参数解析 ----------
 card_dir=""
 branch=""
@@ -379,9 +489,10 @@ if ! command -v gh >/dev/null 2>&1; then
   die 5 "push 已成功（$remote/$branch @ $head_sha），但 gh CLI 不可用 → PR 未创建，需人工开 PR。"
 fi
 
-existing_pr="$(gh pr view "$branch" --json url --jq .url 2>/dev/null || true)"
+existing_pr="$(timeout 15 gh pr view "$branch" --json url --jq .url 2>/dev/null || true)"
 if [ -n "$existing_pr" ]; then
-  log "PR 已存在，复用（不新建）：$existing_pr"
+  record_spi "$existing_pr"
+  log "PR 已存在，复用并写入稳定 SPI（不新建）：$existing_pr"
   log "DONE（commit=$head_sha · PR=$existing_pr）"
   exit 0
 fi
@@ -402,11 +513,13 @@ if [ -z "$pr_body_file" ]; then
 fi
 [ -r "$pr_body_file" ] || die 5 "push 已成功但 PR 正文文件不可读：$pr_body_file（需人工开 PR）"
 
-pr_url="$(gh pr create --base "$base" --head "$branch" \
+pr_url="$(timeout 30 gh pr create --base "$base" --head "$branch" \
   --title "$pr_title" --body-file "$pr_body_file" 2>&1)" || {
   printf '%s\n' "$pr_url" >&2
   die 5 "push 已成功（$remote/$branch @ $head_sha），但 gh pr create 失败（详见上方输出）→ 需人工开 PR。"
 }
-printf '%s\n' "$pr_url" | tail -1
-log "DONE（commit=$head_sha · 分支已推送 · PR 已创建）。合并动作不在本脚本范围内——须经 HITL-5 人工授权。"
+pr_url="$(printf '%s\n' "$pr_url" | tail -1)"
+record_spi "$pr_url"
+printf '%s\n' "$pr_url"
+log "DONE（commit=$head_sha · 分支已推送 · PR 已创建 · 稳定 SPI 已写入）。合并动作不在本脚本范围内——须经 HITL-5 人工授权。"
 exit 0

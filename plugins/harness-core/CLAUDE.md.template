@@ -24,7 +24,7 @@
 
 收到任何涉及**代码或配置改动**的用户请求时（含口语化的"加个功能 / 改个 bug / 调一下…"），**首条响应必须**按以下顺序执行；**禁止跨步、禁止以"已经知道怎么做"为由直接编码**：
 
-1. **先建变更目录**：在 `.harness/changes/` 下复制 `_TEMPLATE/` 为 `<type>-<slug>-<YYYYMMDD>/`，立即更新其 `summary.md` 头部（变更类型、需求名称、日期、当前阶段=1、总体状态=IN_PROGRESS）。
+1. **先取得开卡授权，再建变更目录**：首次创建 `.harness/changes/<card>` 前，先确定唯一完整卡名，并取得绑定 canonical project/card/worktree/session 的真实、单卡、单次用户授权。独立 `card-create` gate 必须在创建工具执行前原子消费 `pending → consumed`；工具随后成功、失败、半创建或崩溃均不返还，完全未创建的重试也须新授权。该授权不替代 HITL、push、merge 或 deploy 等其他 gate。授权闭合后，复制 `_TEMPLATE/` 为 `<type>-<slug>-<YYYYMMDD>/`，立即更新其 `summary.md` 头部（变更类型、需求名称、日期、当前阶段=1、总体状态=IN_PROGRESS）。
 2. **先做阶段 1（request-analysis）**：产出 `request_analysis/spec.md` 与 `tasks.md`，进入 **HITL-1** 暂停等用户确认。**禁止跳过 spec 直接进入阶段 3**。
 3. **阶段 2 评审通过前**，禁止 `Edit` / `Write` 任何业务代码（`src/**` 等业务目录）；仅允许编辑 `.harness/changes/<本次>/**/*.md` 与必要的 `summary.md`。
 4. **流程豁免（L 旁路通道）**：豁免类型为 **4 类封闭枚举**——**L1 咨询·读代码 / L2 文档非业务 / L3 远程同步 / L4 临时调试**；豁免走 L 通道、不建变更目录，受三条防滥用边界约束：**B1 产物即升格**（L 通道内一旦要 Write/Edit 业务工件，立即终止 L、转回变更流程）、**B2 单轮不传染**（豁免只覆盖本轮请求，不延续到后续轮次）、**B3 类型有限枚举**（4 类之外一律不豁免）。
@@ -115,7 +115,7 @@ Owner 委派任何 `generator` / `reviewer` 子 Agent 时，prompt **必须**包
 2. **HITL-2 计划评审后确认**（阶段 2 后）：阶段 2 需求评审 APPROVED 后，**暂停等用户确认计划**，方可进入阶段 3 编码。评审未 APPROVED 不得越过。
 3. **HITL-3 评审与单测确认**（阶段 4 与阶段 5 均完成后、阶段 6 前）：编码评审（阶段 4）与单测编写（阶段 5）**均闭合后**，**暂停等用户确认评审结论 + 单测状态**，方可进入阶段 6。
 4. **HITL-4 部署环境参数确认**（阶段 9 前）：部署验证前，**暂停等用户确认部署环境参数**。**部署参数等关键值禁止推测**，必须由人确认。
-5. **HITL-5 最终交付确认**（阶段 10）：**暂停等用户确认交付**（含 PR 合并授权）；授权后、merge 前按 **DF-013** 在分支内翻牌 summary 终态（总体状态→PASSED / 当前阶段→10 / merge SHA 占位），该翻牌 commit 随 PR 合并进 main。
+5. **HITL-5 最终交付确认**（阶段 10）：阶段 8/9 完成后，**暂停等用户确认最终交付**。确认后在原分支把 summary 翻为唯一闭合终态（总体状态→`PASSED` / 当前阶段→`10`），形成终态 commit；阶段 7 的 SPI 保持 `PR #<n> · https://github.com/<owner>/<repo>/pull/<n>`，不得写 PR head、终态 commit SHA 或 merge SHA。随后须另取独立 push 授权并推送终态 commit，运行时核对 GitHub PR head 等于本地终态 commit，等待该 head 的 required checks 完成；任一步失败即停止，修复产生新 commit 时重新核对。最后须另取独立 merge 授权方可合并。merge 后仅按需只读查询 DME，不回填 summary、不新建回填卡/commit/push/PR。
 
 > 元流程另有独立 HITL（入口 HITL-0.5 + M0/M1/M2 + M3.1/M3.2/M3.3 + M4/M5 各出口），与本 10 阶段 HITL-1~5 属不同层级、勿混——详见文末 M0.5 能力锚。
 
@@ -133,7 +133,7 @@ Owner 委派任何 `generator` / `reviewer` 子 Agent 时，prompt **必须**包
 
 > 权威定义见 `.harness/rules/开发流程规范.md` DF-007 / DF-008 / DF-011 / DF-013（经参考层注入常驻）。本节只放决策时刻要点。
 
-- **禁止未经显式授权向 `main` 推送/合并**：commit 随阶段门禁默认授权 · push（开 PR）为阶段 7 门禁内显式授权动作 · merge 绑定 HITL-5 前确认。
+- **禁止未经独立显式授权推送/合并**：commit 随阶段门禁默认授权；阶段 7 首次 push（开 PR）、HITL-5 后终态 commit 的 push、以及随后 merge 是相互独立的授权动作，HITL-5/CCA/其他 gate 均不替代。
 - **禁止执行不可逆/危险命令**（`rm` / `sudo` 等）；禁止推测部署参数等关键值。
 - **分支策略**：每张变更卡一个分支一个 PR（`change/<type>-<slug>-<YYYYMMDD>`）→ PR → 经显式授权以 merge commit 合并进 `main`。
 - **跨分支卫生**：跨分支操作前 `git status` 确认工作树干净；禁止 `&&`/`;`/`||` 串联含跨分支动作的复合 git 命令；分步执行并 `git branch --show-current` 核对当前分支。

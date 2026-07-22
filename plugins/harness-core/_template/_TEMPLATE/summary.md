@@ -33,7 +33,7 @@
 | 4 编码评审 | PENDING | 0/2 | coding/review/ |
 | 5 单测编写 | PENDING | - | unit_test/ |
 | 6 单测评审 | PENDING | 0/2 | unit_test/review/ |
-| 7 代码推送 | PENDING | - | {{commit 链接}} |
+| 7 代码推送 | PENDING | - | PR #<n> · https://github.com/<owner>/<repo>/pull/<n> |
 | 8 CI 验证 | PENDING | - | ci_result/ci_result.md |
 | 9 部署验证 | PENDING | - | deployment/deployment_report.md |
 | 10 用户确认 | PENDING | - | - |
